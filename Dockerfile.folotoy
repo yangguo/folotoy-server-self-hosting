@@ -1,0 +1,5 @@
+FROM lewangdev/folotoy-server:latest
+
+RUN pip install --no-cache-dir edge-tts==7.2.8
+
+COPY main.py.smart /src/folotoy/main.py

@@ -1,0 +1,82 @@
+import re
+
+import edge_tts
+
+
+_OriginalCommunicate = edge_tts.Communicate
+
+
+def _has_range(text, start, end):
+    return any(start <= ord(ch) <= end for ch in text)
+
+
+def _pick_voice(text, original_voice):
+    text = text or ""
+    original_voice = original_voice or ""
+
+    # Japanese: Hiragana / Katakana.
+    if _has_range(text, 0x3040, 0x30FF):
+        return "ja-JP-NanamiNeural"
+
+    # Korean: Hangul.
+    if _has_range(text, 0xAC00, 0xD7AF):
+        return "ko-KR-SunHiNeural"
+
+    # Common Cantonese written-language markers.
+    cantonese_markers = (
+        "係", "唔", "冇", "喺", "啲", "嘅", "咩", "嗰",
+        "嚟", "咗", "咁", "噉", "哋", "佢", "啱", "喎",
+        "啫", "囉", "㗎", "梗係", "點解", "點樣", "傾偈",
+    )
+    if any(marker in text for marker in cantonese_markers):
+        return "zh-HK-HiuMaanNeural"
+
+    latin = len(re.findall(r"[A-Za-z]", text))
+    cjk = len(re.findall(r"[\u4e00-\u9fff]", text))
+
+    # Predominantly English.
+    if latin >= 6 and latin > cjk * 1.5:
+        return "en-US-AriaNeural"
+
+    if cjk:
+        # Preserve dialect voices for Chinese roles such as Northeast/Shaanxi.
+        if original_voice.startswith("zh-CN-liaoning-"):
+            return original_voice
+        if original_voice.startswith("zh-CN-shaanxi-"):
+            return original_voice
+
+        # A Cantonese role speaking Mandarin uses a Mandarin voice.
+        if original_voice.startswith("zh-HK-"):
+            return "zh-CN-XiaoxiaoNeural"
+
+    # Unknown or mixed language: keep the role's configured voice.
+    return original_voice
+
+
+def SmartCommunicate(text, voice, *args, **kwargs):
+    selected = _pick_voice(text, voice)
+
+    if selected != voice:
+        print(
+            f"[smart-tts] {voice} -> {selected}: {str(text)[:40]!r}",
+            flush=True,
+        )
+
+    return _OriginalCommunicate(text, selected, *args, **kwargs)
+
+
+# Patch edge-tts before importing the FoloToy application.
+edge_tts.Communicate = SmartCommunicate
+
+from app import run
+
+
+def main():
+    try:
+        run()
+    except Exception as error:
+        print(error)
+
+
+if __name__ == "__main__":
+    main()

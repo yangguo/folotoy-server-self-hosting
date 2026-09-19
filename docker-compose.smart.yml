@@ -1,0 +1,6 @@
+services:
+  folotoy:
+    image: folotoy-server-smart:local
+    build:
+      context: .
+      dockerfile: Dockerfile.folotoy
