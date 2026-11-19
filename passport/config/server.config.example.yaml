@@ -1,0 +1,75 @@
+# Generated into the upstream checkout as data/.config.yaml.
+# Do not put a real auth_key in git. scripts/write_config.py fills auth_key
+# from PASSPORT_AUTH_KEY or a runtime-generated file.
+server:
+  ip: 0.0.0.0
+  port: 8000
+  http_port: 8003
+  websocket: ws://127.0.0.1:18010/xiaozhi/v1/
+  vision_explain: http://127.0.0.1:18013/mcp/vision/explain
+  timezone_offset: 8
+  auth_key: replace-with-a-long-random-string
+  auth:
+    enabled: true
+    allowed_devices: []
+  mqtt_gateway: null
+  mqtt_signature_key: null
+  udp_gateway: null
+
+read_config_from_api: false
+enable_wakeup_words_response_cache: false
+enable_greeting: false
+end_prompt:
+  enable: false
+
+xiaozhi:
+  type: hello
+  version: 1
+  transport: websocket
+  audio_params:
+    format: opus
+    sample_rate: 16000
+    channels: 1
+    frame_duration: 60
+
+selected_module:
+  VAD: SileroVAD
+  ASR: PassportLocalASR
+  LLM: PassportLocalLLM
+  TTS: PassportLocalTTS
+  Memory: nomem
+  Intent: nointent
+
+VAD:
+  SileroVAD:
+    type: silero
+    threshold: 0.5
+    threshold_low: 0.3
+    model_dir: models/snakers4_silero-vad
+    min_silence_duration_ms: 200
+
+ASR:
+  PassportLocalASR:
+    type: openai
+    api_key: local-fake-provider
+    base_url: http://127.0.0.1:18019/v1/audio/transcriptions
+    model_name: fake-asr
+    output_dir: tmp/
+
+LLM:
+  PassportLocalLLM:
+    type: openai
+    api_key: local-fake-provider
+    base_url: http://127.0.0.1:18019/v1
+    model_name: fake-llm
+
+TTS:
+  PassportLocalTTS:
+    type: openai
+    api_key: local-fake-provider
+    api_url: http://127.0.0.1:18019/v1/audio/speech
+    model: fake-tts
+    voice: alloy
+    format: wav
+    speed: 1
+    output_dir: tmp/

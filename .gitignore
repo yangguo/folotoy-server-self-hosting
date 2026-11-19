@@ -1,3 +1,6 @@
+# Passport opt-in runtime (cloned upstream, venv, generated config, logs)
+passport/runtime/
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
