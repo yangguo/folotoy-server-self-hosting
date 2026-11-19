@@ -1,0 +1,38 @@
+# Opt-in AI Passport stack. It does not attach to the root docker-compose.yml
+# networks, volumes, or ports (1883, 8082, 8083, 8085, 18083).
+name: folotoy-passport
+
+services:
+  fake-provider:
+    image: python:3.12-slim-bookworm
+    command: ["python", "/opt/passport/fake_provider.py", "--host", "0.0.0.0", "--port", "18019"]
+    volumes:
+      - ./fake_provider.py:/opt/passport/fake_provider.py:ro
+    ports:
+      - "127.0.0.1:18019:18019"
+    restart: "no"
+
+  xiaozhi-server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        XIAOZHI_SERVER_COMMIT: 8f2dda09cf18f1c1ece0f906eee4cc2fabb7fb58
+    depends_on:
+      - fake-provider
+    environment:
+      XIAOZHI_HOME: /opt/xiaozhi-esp32-server
+      PASSPORT_AUTH_FILE: /opt/passport/runtime/auth_key
+      PASSPORT_BIND: 0.0.0.0
+      PASSPORT_WS_BIND_PORT: "8000"
+      PASSPORT_HTTP_BIND_PORT: "8003"
+      PASSPORT_PUBLIC_WS: ws://127.0.0.1:18010/xiaozhi/v1/
+      PASSPORT_PUBLIC_HTTP: http://127.0.0.1:18013/mcp/vision/explain
+      PASSPORT_FAKE_BASE: http://fake-provider:18019
+      PASSPORT_AUTH_KEY: ${PASSPORT_AUTH_KEY:-}
+    volumes:
+      - ./runtime:/opt/passport/runtime
+    ports:
+      - "127.0.0.1:18010:8000"
+      - "127.0.0.1:18013:8003"
+    restart: "no"
