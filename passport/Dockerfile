@@ -16,15 +16,26 @@ RUN git clone --depth 1 --branch v0.9.8 https://github.com/xinnan-tech/xiaozhi-e
     && rm -rf /tmp/src
 
 COPY requirements-runtime.txt /tmp/requirements-runtime.txt
-RUN pip install --no-cache-dir -r /tmp/requirements-runtime.txt
+RUN pip install --no-cache-dir -r /tmp/requirements-runtime.txt \
+    && rm -f /tmp/requirements-runtime.txt
 
-# Upstream SileroVAD loads models/snakers4_silero-vad/src/silero_vad/data/silero_vad.onnx.
-RUN python -c "import pathlib, shutil, silero_vad; src=pathlib.Path(silero_vad.__file__).parent; hits=list(src.rglob('silero_vad.onnx')); assert hits, src; dest=pathlib.Path('/opt/xiaozhi-esp32-server/models/snakers4_silero-vad/src/silero_vad/data'); dest.mkdir(parents=True, exist_ok=True); shutil.copy(hits[0], dest/'silero_vad.onnx')"
+# Upstream v0.9.8 already vendors models/snakers4_silero-vad/src/silero_vad/data/silero_vad.onnx;
+# verify its SHA-256 digest directly without pulling torch or silero_vad from PyPI.
+RUN python -c "import hashlib, pathlib; p=pathlib.Path('/opt/xiaozhi-esp32-server/models/snakers4_silero-vad/src/silero_vad/data/silero_vad.onnx'); assert hashlib.sha256(p.read_bytes()).hexdigest() == '2623a2953f6ff3d2c1e61740c6cdb7168133479b267dfef114a4a3cc5bdd788f', p"
 
 WORKDIR /opt/xiaozhi-esp32-server
+COPY passport_server /opt/passport/passport_server
 COPY config/server.config.example.yaml /opt/passport/config/server.config.example.yaml
+COPY config/demo.config.yaml /opt/passport/config/demo.config.yaml
 COPY scripts/write_config.py /opt/passport/scripts/write_config.py
+COPY scripts/provision_device.py /opt/passport/scripts/provision_device.py
+COPY scripts/entrypoint.sh /opt/passport/scripts/entrypoint.sh
+RUN chmod +x /opt/passport/scripts/entrypoint.sh /opt/passport/scripts/provision_device.py /opt/passport/passport_server/runner.py
+
 ENV XIAOZHI_HOME=/opt/xiaozhi-esp32-server
+ENV PASSPORT_MODE=real
+ENV PASSPORT_CONFIG_FILE=/opt/passport/config/server.config.yaml
+ENV PASSPORT_DEVICES_FILE=/opt/passport/runtime/devices.yaml
 ENV PASSPORT_AUTH_FILE=/opt/passport/runtime/auth_key
 EXPOSE 8000 8003
-CMD ["sh", "-c", "python /opt/passport/scripts/write_config.py && python app.py"]
+ENTRYPOINT ["/opt/passport/scripts/entrypoint.sh"]

@@ -1,0 +1,22 @@
+# Explicit demo / contract-test Compose override using fake_provider.py.
+# Usage:
+#   docker compose -f docker-compose.yml -f docker-compose.demo.yml up --build
+#
+# fake-provider is kept internal to the Compose network (no host port publish).
+services:
+  fake-provider:
+    image: python:3.12-slim-bookworm
+    command: ["python", "/opt/passport/fake_provider.py", "--host", "0.0.0.0", "--port", "18019"]
+    volumes:
+      - ./fake_provider.py:/opt/passport/fake_provider.py:ro
+    restart: "no"
+
+  xiaozhi-server:
+    depends_on:
+      - fake-provider
+    environment:
+      PASSPORT_MODE: demo
+      PASSPORT_CONFIG_FILE: /opt/passport/config/demo.config.yaml
+      PASSPORT_FAKE_BASE: http://fake-provider:18019
+      PASSPORT_PUBLIC_WS: ws://127.0.0.1:18010/xiaozhi/v1/
+      PASSPORT_PUBLIC_HTTP: http://127.0.0.1:18013/mcp/vision/explain

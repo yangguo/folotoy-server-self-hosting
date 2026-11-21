@@ -1,3 +1,4 @@
 runtime
 .env
+config/server.config.yaml
 __pycache__

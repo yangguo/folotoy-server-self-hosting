@@ -1,16 +1,32 @@
-# Generated into the upstream checkout as data/.config.yaml.
-# Do not put a real auth_key in git. scripts/write_config.py fills auth_key
-# from PASSPORT_AUTH_KEY or a runtime-generated file.
+# Real deployment template for Passport xiaozhi-server.
+#
+# Copy this file to passport/config/server.config.yaml (ignored by git) and fill
+# in your real provider URLs, API keys, and public endpoint before running in
+# default real mode (PASSPORT_MODE=real).
+#
+# Do NOT put real credentials in git. Do NOT edit generated data/.config.yaml:
+# scripts/write_config.py renders data/.config.yaml from your source config.
+#
+# Security recommendations:
+# - Terminate TLS with a reverse proxy (HTTPS for /xiaozhi/ota/ and WSS for
+#   /xiaozhi/v1/) before exposing Passport outside localhost, or restrict access
+#   to a controlled private network/VPN. Plaintext HTTP/WS exposes OTA tokens
+#   and audio on the wire.
+# - Provision every device in devices.yaml via scripts/provision_device.py.
+#   In Passport, server.auth.allowed_devices NEVER skips token verification.
 server:
   ip: 0.0.0.0
   port: 8000
   http_port: 8003
-  websocket: ws://127.0.0.1:18010/xiaozhi/v1/
-  vision_explain: http://127.0.0.1:18013/mcp/vision/explain
+  websocket: wss://your-passport-host.example.com/xiaozhi/v1/
+  vision_explain: https://your-passport-host.example.com/mcp/vision/explain
   timezone_offset: 8
   auth_key: replace-with-a-long-random-string
   auth:
     enabled: true
+    expire_seconds: 2592000
+    devices_file: /opt/passport/runtime/devices.yaml
+    # Note: allowed_devices does NOT bypass token or provisioned-device checks.
     allowed_devices: []
   mqtt_gateway: null
   mqtt_signature_key: null
@@ -19,6 +35,7 @@ server:
 read_config_from_api: false
 enable_wakeup_words_response_cache: false
 enable_greeting: false
+tts_timeout: 15
 end_prompt:
   enable: false
 
@@ -34,9 +51,9 @@ xiaozhi:
 
 selected_module:
   VAD: SileroVAD
-  ASR: PassportLocalASR
-  LLM: PassportLocalLLM
-  TTS: PassportLocalTTS
+  ASR: OpenAIASR
+  LLM: OpenAILLM
+  TTS: OpenAITTS
   Memory: nomem
   Intent: nointent
 
@@ -49,26 +66,36 @@ VAD:
     min_silence_duration_ms: 200
 
 ASR:
-  PassportLocalASR:
+  OpenAIASR:
     type: openai
-    api_key: local-fake-provider
-    base_url: http://127.0.0.1:18019/v1/audio/transcriptions
-    model_name: fake-asr
+    api_key: replace-with-your-asr-api-key
+    base_url: https://api.openai.com/v1/audio/transcriptions
+    model_name: whisper-1
     output_dir: tmp/
+    connect_timeout: 5
+    read_timeout: 15
+    write_timeout: 10
+    pool_timeout: 5
+    total_timeout: 20
 
 LLM:
-  PassportLocalLLM:
+  OpenAILLM:
     type: openai
-    api_key: local-fake-provider
-    base_url: http://127.0.0.1:18019/v1
-    model_name: fake-llm
+    api_key: replace-with-your-llm-api-key
+    base_url: https://api.openai.com/v1
+    model_name: gpt-4o-mini
+    timeout:
+      connect: 5
+      read: 30
+      write: 10
+      pool: 5
 
 TTS:
-  PassportLocalTTS:
+  OpenAITTS:
     type: openai
-    api_key: local-fake-provider
-    api_url: http://127.0.0.1:18019/v1/audio/speech
-    model: fake-tts
+    api_key: replace-with-your-tts-api-key
+    api_url: https://api.openai.com/v1/audio/speech
+    model: tts-1
     voice: alloy
     format: wav
     speed: 1
