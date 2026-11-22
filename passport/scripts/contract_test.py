@@ -28,6 +28,22 @@ DEFAULT_TTS_SECONDS = 1.5
 MAX_ABORT_TOTAL_FRAMES = 18
 MAX_ABORT_TAIL_FRAMES = 12
 MAX_ABORT_STOP_LATENCY_S = 2.0
+POST_STOP_OBSERVE_S = 0.5
+MIN_POST_STOP_OBSERVE_S = 0.45
+
+
+def set_fake_control(fake_control_url: str, payload: dict) -> dict:
+    """Update fake_provider control parameters and assert the control call succeeded."""
+    status, body = post_json(f"{fake_control_url.rstrip('/')}/_control", {}, payload)
+    if status != 200 or not body.get("ok"):
+        raise AssertionError(f"fake_provider /_control failed ({status}): {body}")
+    if "tts_seconds" in payload and float(body.get("tts_seconds", -1)) != float(
+        payload["tts_seconds"]
+    ):
+        raise AssertionError(
+            f"fake_provider /_control ignored tts_seconds={payload['tts_seconds']}: {body}"
+        )
+    return body
 
 
 def post_json(url: str, headers: dict, payload: dict | bytes = b"{}") -> tuple[int, dict]:
@@ -189,16 +205,26 @@ async def run_turn(
                 stop_received_at = time.monotonic()
                 break
 
+    post_stop_observed_s = 0.0
     if aborted and stop_received_at is not None:
-        # Drain briefly to ensure no trailing audio arrives after tts.stop.
-        drain_until = asyncio.get_running_loop().time() + 0.35
-        while asyncio.get_running_loop().time() < drain_until:
+        # Observe the full post-stop window without breaking early on brief silence.
+        drain_start = asyncio.get_running_loop().time()
+        drain_until = drain_start + POST_STOP_OBSERVE_S
+        while True:
+            remaining = drain_until - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                break
             try:
-                extra = await asyncio.wait_for(ws.recv(), 0.1)
-            except (asyncio.TimeoutError, websockets.exceptions.ConnectionClosed):
+                extra = await asyncio.wait_for(ws.recv(), remaining)
+            except asyncio.TimeoutError:
+                break
+            except websockets.exceptions.ConnectionClosed:
                 break
             if isinstance(extra, bytes):
                 frames_after_stop += 1
+        post_stop_observed_s = round(
+            asyncio.get_running_loop().time() - drain_start, 4
+        )
 
     abort_stop_latency_s = (
         round(stop_received_at - abort_sent_at, 4)
@@ -217,13 +243,22 @@ async def run_turn(
         "frames_before_abort": frames_before_abort,
         "tail_frames_after_abort": tail_frames_after_abort,
         "frames_after_stop": frames_after_stop,
+        "post_stop_observed_s": post_stop_observed_s,
         "abort_stop_latency_s": abort_stop_latency_s,
     }
 
 
-def validate_abort_metrics(result: dict, expected_long_frames_min: int = 50) -> list[str]:
-    """Strictly assert that abort truncated TTS playback early rather than playing to completion."""
+def validate_abort_metrics(
+    result: dict,
+    baseline_long_frames: int,
+    expected_long_frames_min: int = 50,
+) -> list[str]:
+    """Strictly assert that abort truncated long TTS playback compared to unaborted baseline."""
     problems = []
+    if baseline_long_frames < expected_long_frames_min:
+        problems.append(
+            f"long-audio baseline produced too few frames ({baseline_long_frames} < {expected_long_frames_min})"
+        )
     if not result.get("aborted"):
         problems.append("abort was never sent")
     if "stop" not in (result.get("tts_states") or []):
@@ -231,11 +266,16 @@ def validate_abort_metrics(result: dict, expected_long_frames_min: int = 50) -> 
     total_frames = int(result.get("opus_frame_count") or 0)
     tail_frames = int(result.get("tail_frames_after_abort") or 0)
     after_stop = int(result.get("frames_after_stop") or 0)
+    observed_s = float(result.get("post_stop_observed_s") or 0.0)
     latency = result.get("abort_stop_latency_s")
 
     if total_frames >= expected_long_frames_min:
         problems.append(
             f"abort did not truncate long TTS audio ({total_frames} frames >= {expected_long_frames_min})"
+        )
+    if baseline_long_frames > 0 and total_frames >= baseline_long_frames * 0.35:
+        problems.append(
+            f"abort frames ({total_frames}) not significantly shorter than baseline ({baseline_long_frames})"
         )
     if total_frames > MAX_ABORT_TOTAL_FRAMES:
         problems.append(
@@ -247,6 +287,10 @@ def validate_abort_metrics(result: dict, expected_long_frames_min: int = 50) -> 
         )
     if after_stop != 0:
         problems.append(f"received {after_stop} audio frames after tts.stop")
+    if observed_s < MIN_POST_STOP_OBSERVE_S:
+        problems.append(
+            f"post-stop observation window exited early: {observed_s:.3f}s < {MIN_POST_STOP_OBSERVE_S}s"
+        )
     if latency is None or latency > MAX_ABORT_STOP_LATENCY_S:
         problems.append(
             f"abort->stop latency too high: {latency!r} > {MAX_ABORT_STOP_LATENCY_S}s"
@@ -284,33 +328,26 @@ async def run_ws_contract(
         "Authorization": f"Bearer {token}",
     }
 
-    # 1. Immediate first turn (0 s wait after hello), then strict abort + same-session recovery.
+    # 1. Immediate first turn (0 s wait after hello), unaborted long-audio baseline, then strict abort + recovery.
     async with websockets.connect(ws_url, additional_headers=headers) as ws:
         hello1 = await send_hello(ws)
         first = await run_turn(ws, hello1["session_id"], abort_after_frames=None)
 
-        post_json(
-            f"{fake_control_url.rstrip('/')}/_control",
-            {},
-            {"tts_seconds": LONG_TTS_SECONDS},
-        )
+        set_fake_control(fake_control_url, {"tts_seconds": LONG_TTS_SECONDS})
         try:
-            abort_turn = await run_turn(ws, hello1["session_id"], abort_after_frames=2)
-        finally:
-            post_json(
-                f"{fake_control_url.rstrip('/')}/_control",
-                {},
-                {"tts_seconds": DEFAULT_TTS_SECONDS},
+            long_baseline_turn = await run_turn(
+                ws, hello1["session_id"], abort_after_frames=None
             )
+            abort_turn = await run_turn(
+                ws, hello1["session_id"], abort_after_frames=2
+            )
+        finally:
+            set_fake_control(fake_control_url, {"tts_seconds": DEFAULT_TTS_SECONDS})
 
         post_abort_turn = await run_turn(ws, hello1["session_id"], abort_after_frames=None)
 
     # 2. Abrupt mid-TTS transport drop, followed by reconnect recovery.
-    post_json(
-        f"{fake_control_url.rstrip('/')}/_control",
-        {},
-        {"tts_seconds": LONG_TTS_SECONDS},
-    )
+    set_fake_control(fake_control_url, {"tts_seconds": LONG_TTS_SECONDS})
     dropped_session_id = ""
     try:
         ws_drop = await websockets.connect(ws_url, additional_headers=headers)
@@ -346,11 +383,7 @@ async def run_ws_contract(
             if ws_drop.transport is not None and not ws_drop.transport.is_closing():
                 ws_drop.transport.abort()
     finally:
-        post_json(
-            f"{fake_control_url.rstrip('/')}/_control",
-            {},
-            {"tts_seconds": DEFAULT_TTS_SECONDS},
-        )
+        set_fake_control(fake_control_url, {"tts_seconds": DEFAULT_TTS_SECONDS})
 
     async with websockets.connect(ws_url, additional_headers=headers) as ws_rec:
         hello_rec = await send_hello(ws_rec)
@@ -365,6 +398,7 @@ async def run_ws_contract(
             "audio_params": hello1.get("audio_params"),
         },
         "first_turn_immediate": first,
+        "long_baseline_turn": long_baseline_turn,
         "abort_turn": abort_turn,
         "post_abort_same_session_turn": post_abort_turn,
         "abrupt_drop_session_id": dropped_session_id,
@@ -387,7 +421,7 @@ def main() -> None:
     if not args.ota_secret:
         sys.exit("OTA secret must be provided via --ota-secret or PASSPORT_TEST_OTA_SECRET")
 
-    post_json(f"{args.fake_control.rstrip('/')}/_control", {}, {"reset": True})
+    set_fake_control(args.fake_control, {"reset": True})
 
     report: dict = {"kind": "upstream-server-with-local-fake-providers"}
     missing_device = post_ota(args.ota, {})
@@ -466,6 +500,7 @@ def main() -> None:
 
     for turn_key in (
         "first_turn_immediate",
+        "long_baseline_turn",
         "post_abort_same_session_turn",
         "reconnect_after_drop_turn",
     ):
@@ -480,7 +515,10 @@ def main() -> None:
     if "认证失败" not in (report["bad_token"].get("received") or ""):
         problems.append(f"bad token result was {report['bad_token']}")
 
-    problems.extend(validate_abort_metrics(report["abort_turn"]))
+    baseline_frames = int(report["long_baseline_turn"]["opus_frame_count"])
+    problems.extend(
+        validate_abort_metrics(report["abort_turn"], baseline_long_frames=baseline_frames)
+    )
 
     if not report["reconnect_new_session"]:
         problems.append("reconnect after abrupt drop reused the session id")

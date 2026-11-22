@@ -23,12 +23,32 @@ def main() -> None:
 
     apply_all_patches()
 
+    from config.config_loader import load_config
+    from config.settings import check_config_file
+    from core.utils.cache.manager import CacheType, cache_manager
+    from loguru import logger
+    from passport_server.device_auth import validate_runtime_auth_config
+    from passport_server.redaction import register_secrets_from_config
+
+    try:
+        check_config_file()
+        main_config = cache_manager.get(CacheType.CONFIG, "main_config")
+        if main_config is None:
+            main_config = asyncio.run(load_config())
+        validate_runtime_auth_config(main_config)
+        register_secrets_from_config(main_config)
+    except Exception as exc:
+        logger.complete()
+        sys.exit(f"Passport configuration validation failed: {exc}")
+
     import app
 
     try:
         asyncio.run(app.main())
     except KeyboardInterrupt:
         print("手动中断，程序终止。")
+    finally:
+        logger.complete()
 
 
 if __name__ == "__main__":

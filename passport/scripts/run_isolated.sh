@@ -6,6 +6,8 @@ set -eu
 
 ROOT=$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)
 RUNTIME="$ROOT/runtime"
+DEMO_RUNTIME="${PASSPORT_DEMO_RUNTIME:-$ROOT/runtime-demo}"
+DEMO_HOME="$DEMO_RUNTIME/xiaozhi-home"
 SHA=8f2dda09cf18f1c1ece0f906eee4cc2fabb7fb58
 SRC="$RUNTIME/xiaozhi-esp32-server"
 SERVER="$SRC/main/xiaozhi-server"
@@ -34,6 +36,18 @@ pick_python() {
 }
 
 PY_BIN=$(pick_python)
+
+# Refuse before creating any demo directory if demo paths point inside real runtime/.
+"$PY_BIN" - "$RUNTIME" "$DEMO_RUNTIME" "$DEMO_HOME" "$DEMO_RUNTIME/devices.yaml" "$DEMO_RUNTIME/auth_key" "$DEMO_HOME/tmp" <<'PY'
+import pathlib, sys
+real_runtime = pathlib.Path(sys.argv[1]).resolve()
+for raw in sys.argv[2:]:
+    cand = pathlib.Path(raw).resolve()
+    if cand == real_runtime or real_runtime in cand.parents:
+        sys.exit(f"Refusing demo run with path inside real runtime directory: {cand}")
+PY
+
+mkdir -p "$DEMO_RUNTIME" "$DEMO_HOME/data" "$DEMO_HOME/tmp"
 
 if [ ! -d "$SRC/.git" ]; then
   git clone --depth 1 --branch v0.9.8 "$UPSTREAM_REPO" "$SRC"
@@ -65,18 +79,27 @@ assert digest == expected, f"unexpected silero_vad.onnx sha256: {digest} != {exp
 print("silero verified:", p, digest[:12])
 PY
 
-export XIAOZHI_HOME="$SERVER"
+for item in app.py config core models plugins_func config.yaml; do
+  if [ -e "$SERVER/$item" ]; then
+    ln -sfn "$SERVER/$item" "$DEMO_HOME/$item"
+  fi
+done
+
+export XIAOZHI_HOME="$DEMO_HOME"
 export PASSPORT_MODE=demo
-export PASSPORT_AUTH_FILE="$RUNTIME/auth_key"
-export PASSPORT_DEVICES_FILE="$RUNTIME/devices.yaml"
+export PASSPORT_CONFIG_FILE="$ROOT/config/demo.config.yaml"
+export PASSPORT_AUTH_FILE="$DEMO_RUNTIME/auth_key"
+export PASSPORT_DEVICES_FILE="$DEMO_RUNTIME/devices.yaml"
+export PASSPORT_LOG_DIR="$DEMO_HOME/tmp"
 export PASSPORT_BIND="${PASSPORT_BIND:-127.0.0.1}"
 export PASSPORT_WS_BIND_PORT="${PASSPORT_WS_BIND_PORT:-18010}"
 export PASSPORT_HTTP_BIND_PORT="${PASSPORT_HTTP_BIND_PORT:-18013}"
-export PASSPORT_PUBLIC_WS="${PASSPORT_PUBLIC_WS:-ws://127.0.0.1:18010/xiaozhi/v1/}"
-export PASSPORT_PUBLIC_HTTP="${PASSPORT_PUBLIC_HTTP:-http://127.0.0.1:18013/mcp/vision/explain}"
-export PASSPORT_FAKE_BASE="${PASSPORT_FAKE_BASE:-http://127.0.0.1:18019}"
+export PASSPORT_FAKE_PORT="${PASSPORT_FAKE_PORT:-18019}"
+export PASSPORT_PUBLIC_WS="${PASSPORT_PUBLIC_WS:-ws://${PASSPORT_BIND}:${PASSPORT_WS_BIND_PORT}/xiaozhi/v1/}"
+export PASSPORT_PUBLIC_HTTP="${PASSPORT_PUBLIC_HTTP:-http://${PASSPORT_BIND}:${PASSPORT_HTTP_BIND_PORT}/mcp/vision/explain}"
+export PASSPORT_FAKE_BASE="${PASSPORT_FAKE_BASE:-http://127.0.0.1:${PASSPORT_FAKE_PORT}}"
 
-# Provision a fresh ephemeral contract-test device without leaving credentials in git.
+# Provision a fresh ephemeral contract-test device inside DEMO_RUNTIME only.
 rm -f "$PASSPORT_DEVICES_FILE"
 CONTRACT_SECRET=$("$VENV/bin/python" - <<'PY'
 import secrets
@@ -98,22 +121,22 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-"$VENV/bin/python" "$ROOT/fake_provider.py" --host 127.0.0.1 --port 18019 \
-  > "$RUNTIME/fake-provider.log" 2>&1 &
+"$VENV/bin/python" "$ROOT/fake_provider.py" --host 127.0.0.1 --port "$PASSPORT_FAKE_PORT" \
+  > "$DEMO_RUNTIME/fake-provider.log" 2>&1 &
 FAKE_PID=$!
-"$VENV/bin/python" "$ROOT/passport_server/runner.py" > "$RUNTIME/xiaozhi-server.log" 2>&1 &
+"$VENV/bin/python" "$ROOT/passport_server/runner.py" > "$DEMO_RUNTIME/xiaozhi-server.log" 2>&1 &
 SERVER_PID=$!
 
 ready=0
 i=0
 while [ "$i" -lt 60 ]; do
-  if curl -fsS http://127.0.0.1:18013/xiaozhi/ota/ >/dev/null 2>&1; then
+  if curl -fsS "http://${PASSPORT_BIND}:${PASSPORT_HTTP_BIND_PORT}/xiaozhi/ota/" >/dev/null 2>&1; then
     ready=1
     break
   fi
   if ! kill -0 "$SERVER_PID" 2>/dev/null; then
     echo "xiaozhi-server exited during startup" >&2
-    tail -n 80 "$RUNTIME/xiaozhi-server.log" >&2 || true
+    tail -n 80 "$DEMO_RUNTIME/xiaozhi-server.log" >&2 || true
     exit 1
   fi
   i=$((i + 1))
@@ -121,14 +144,14 @@ while [ "$i" -lt 60 ]; do
 done
 if [ "$ready" -ne 1 ]; then
   echo "OTA port did not become ready" >&2
-  tail -n 80 "$RUNTIME/xiaozhi-server.log" >&2 || true
+  tail -n 80 "$DEMO_RUNTIME/xiaozhi-server.log" >&2 || true
   exit 1
 fi
 
 PASSPORT_TEST_OTA_SECRET="$CONTRACT_SECRET" \
   "$VENV/bin/python" "$ROOT/scripts/contract_test.py" \
-    --ota http://127.0.0.1:18013 \
-    --fake-control http://127.0.0.1:18019
+    --ota "http://${PASSPORT_BIND}:${PASSPORT_HTTP_BIND_PORT}" \
+    --fake-control "http://127.0.0.1:${PASSPORT_FAKE_PORT}"
 
 # Stop demo server cleanly so regression_test.py can verify end-to-end logs and run isolated checks.
 kill -TERM "$SERVER_PID" 2>/dev/null || true
@@ -138,5 +161,8 @@ kill -TERM "$FAKE_PID" 2>/dev/null || true
 wait "$FAKE_PID" 2>/dev/null || true
 FAKE_PID=""
 
-"$VENV/bin/python" "$ROOT/scripts/regression_test.py"
-echo "server log: $RUNTIME/xiaozhi-server.log"
+if [ "${PASSPORT_SKIP_REGRESSION:-0}" != "1" ]; then
+  XIAOZHI_HOME="$SERVER" "$VENV/bin/python" "$ROOT/scripts/regression_test.py"
+fi
+echo "demo runtime: $DEMO_RUNTIME"
+echo "server log: $DEMO_RUNTIME/xiaozhi-server.log"

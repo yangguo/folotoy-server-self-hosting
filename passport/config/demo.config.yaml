@@ -14,7 +14,7 @@ server:
   auth:
     enabled: true
     expire_seconds: 86400
-    devices_file: /opt/passport/runtime/devices.yaml
+    devices_file: /opt/passport/runtime-demo/devices.yaml
     allowed_devices: []
   mqtt_gateway: null
   mqtt_signature_key: null

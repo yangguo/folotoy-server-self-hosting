@@ -1,0 +1,203 @@
+# Ready-to-adopt Nginx HTTPS/WSS reverse proxy template for AI Passport.
+#
+# Placement:
+#   1) Place the `http { ... }` block (`map` + `log_format passport_safe`) in
+#      /etc/nginx/conf.d/passport-logging.conf (http context).
+#   2) Place the `server { ... }` block in /etc/nginx/conf.d/passport.conf
+#      (or sites-enabled/passport.conf) and configure your domain + TLS cert.
+#
+# Security & log-safety guarantees:
+# - Per-device OTA secret routes (/xiaozhi/ota/d/<secret>/) disable access logs,
+#   redirect error logging to `/dev/null emerg` (never `error_log off;`), reject
+#   credential-bearing query strings, rewrite to /xiaozhi/ota/, pass the secret
+#   in X-OTA-Secret, and strip tracing/URI headers (X-Original-URI, Referer, etc.).
+# - All other routes use `log_format passport_safe`, which replaces any OTA
+#   secret path segment or query string via `map` and omits Authorization,
+#   X-OTA-Secret, Cookie, and raw $request / $request_uri / $args / $http_referer.
+# - If APM / OpenTelemetry / WAF / ingress tracing is enabled on this proxy,
+#   disable trace capture or scrub `http.target`, `url.path`, `url.full`, and
+#   `http.url` on `/xiaozhi/ota/d/*` so per-device secrets do not enter traces.
+
+# --- BEGIN http {} scope (e.g. /etc/nginx/conf.d/passport-logging.conf) ---
+map $uri $passport_safe_uri {
+    ~(?i)/xiaozhi/ota/d/  "/xiaozhi/ota/d/[REDACTED]/";
+    default               $uri;
+}
+
+map $is_args $passport_safe_query {
+    "?"     "?[REDACTED]";
+    default "";
+}
+
+map $http_referer $passport_safe_referer {
+    ~(?i)/xiaozhi/ota/d/  "[REDACTED]";
+    ~://[^/\s]*@          "[REDACTED]";
+    ~\?                   "[REDACTED]";
+    default               $http_referer;
+}
+
+log_format passport_safe '$remote_addr - [$time_local] '
+                         '"$request_method $passport_safe_uri$passport_safe_query $server_protocol" '
+                         '$status $body_bytes_sent "$passport_safe_referer" '
+                         '"$http_user_agent" req_id=$request_id';
+# --- END http {} scope ---
+
+server {
+    listen 443 ssl;
+    http2 on;
+    server_name your-passport-host.example.com;
+
+    ssl_certificate     /etc/ssl/passport/fullchain.pem;
+    ssl_certificate_key /etc/ssl/passport/privkey.pem;
+    ssl_protocols       TLSv1.2 TLSv1.3;
+
+    access_log /var/log/nginx/passport_access.log passport_safe;
+    error_log  /var/log/nginx/passport_error.log warn;
+
+    # Reject credentials passed in query strings before routing/proxying.
+    if ($args ~* "(^|&)(authorization|token|access_token|refresh_token|id_token|secret|ota_secret|key|api_key|apikey|password|sig|signature|auth)=") {
+        return 400;
+    }
+
+    # Per-device secret OTA path: suppress access/error logs and rewrite to /xiaozhi/ota/.
+    location ^~ /xiaozhi/ota/d/ {
+        access_log off;
+        error_log /dev/null emerg;
+        log_not_found off;
+        log_subrequest off;
+
+        if ($args ~* "(^|&)(authorization|token|access_token|refresh_token|id_token|secret|ota_secret|key|api_key|apikey|password|sig|signature|auth)=") {
+            return 400;
+        }
+
+        location ~ ^/xiaozhi/ota/d/(?<ota_secret_cap>[^/]+)/?$ {
+            access_log off;
+            error_log /dev/null emerg;
+            log_not_found off;
+            log_subrequest off;
+
+            set $passport_ota_secret $ota_secret_cap;
+
+            if ($args ~* "(^|&)(authorization|token|access_token|refresh_token|id_token|secret|ota_secret|key|api_key|apikey|password|sig|signature|auth)=") {
+                return 400;
+            }
+
+            rewrite ^ /xiaozhi/ota/? break;
+
+            proxy_http_version 1.1;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+            proxy_set_header X-Request-ID $request_id;
+            proxy_set_header X-OTA-Secret $passport_ota_secret;
+
+            # Strip raw URI/tracing/credential headers so secrets never echo upstream or to traces.
+            proxy_set_header Authorization "";
+            proxy_set_header X-Original-URI "";
+            proxy_set_header X-Original-URL "";
+            proxy_set_header X-Rewrite-URL "";
+            proxy_set_header X-Forwarded-Uri "";
+            proxy_set_header X-Envoy-Original-Path "";
+            proxy_set_header X-Request-URI "";
+            proxy_set_header Referer "";
+
+            proxy_pass http://127.0.0.1:18013;
+        }
+
+        return 404;
+    }
+
+    location = /xiaozhi/ota/ {
+        access_log /var/log/nginx/passport_access.log passport_safe;
+
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header X-Request-ID $request_id;
+
+        proxy_set_header X-Original-URI "";
+        proxy_set_header X-Original-URL "";
+        proxy_set_header X-Rewrite-URL "";
+        proxy_set_header X-Forwarded-Uri "";
+        proxy_set_header X-Envoy-Original-Path "";
+        proxy_set_header X-Request-URI "";
+        proxy_set_header Referer "";
+
+        proxy_pass http://127.0.0.1:18013;
+    }
+
+    location ^~ /xiaozhi/ota/download/ {
+        access_log /var/log/nginx/passport_access.log passport_safe;
+
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header X-Request-ID $request_id;
+
+        proxy_set_header X-Original-URI "";
+        proxy_set_header X-Original-URL "";
+        proxy_set_header X-Rewrite-URL "";
+        proxy_set_header X-Forwarded-Uri "";
+        proxy_set_header X-Envoy-Original-Path "";
+        proxy_set_header X-Request-URI "";
+        proxy_set_header Referer "";
+
+        proxy_pass http://127.0.0.1:18013;
+    }
+
+    location = /mcp/vision/explain {
+        access_log /var/log/nginx/passport_access.log passport_safe;
+        client_max_body_size 6m;
+
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header X-Request-ID $request_id;
+
+        proxy_set_header X-Original-URI "";
+        proxy_set_header X-Original-URL "";
+        proxy_set_header X-Rewrite-URL "";
+        proxy_set_header X-Forwarded-Uri "";
+        proxy_set_header X-Envoy-Original-Path "";
+        proxy_set_header X-Request-URI "";
+        proxy_set_header Referer "";
+
+        proxy_pass http://127.0.0.1:18013;
+    }
+
+    location ^~ /xiaozhi/v1/ {
+        access_log /var/log/nginx/passport_access.log passport_safe;
+
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header X-Request-ID $request_id;
+
+        proxy_set_header X-Original-URI "";
+        proxy_set_header X-Original-URL "";
+        proxy_set_header X-Rewrite-URL "";
+        proxy_set_header X-Forwarded-Uri "";
+        proxy_set_header X-Envoy-Original-Path "";
+        proxy_set_header X-Request-URI "";
+        proxy_set_header Referer "";
+
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
+        proxy_pass http://127.0.0.1:18010;
+    }
+
+    location / {
+        return 404;
+    }
+}

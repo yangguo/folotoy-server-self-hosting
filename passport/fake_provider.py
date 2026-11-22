@@ -50,11 +50,17 @@ class ProviderState:
         with self.lock:
             self.asr_delays: list[float] = []
             self.asr_status: int = 200
+            self.asr_error_body: str = ""
+            self.tts_status: int = 200
+            self.tts_error_body: str = ""
+            self.accepted_api_keys: list[str] = []
             self.tts_seconds: float = 1.5
             self._wav_cache_seconds: float = 1.5
             self._wav_cache: bytes = sine_wav(1.5)
             self.transcript: str = DEFAULT_TRANSCRIPT
             self.reply: str = DEFAULT_REPLY
+            self.next_asr_req_id: int = 1
+            self.asr_requests: dict[int, dict] = {}
             self.asr_in_flight: int = 0
             self.asr_total: int = 0
             self.asr_completed: int = 0
@@ -71,8 +77,19 @@ class ProviderState:
 
     def stats(self) -> dict:
         with self.lock:
+            in_flight_ids = sorted(
+                req_id
+                for req_id, info in self.asr_requests.items()
+                if info["state"] == "in_flight"
+            )
+            recent_requests = [
+                dict(self.asr_requests[req_id])
+                for req_id in sorted(self.asr_requests.keys())[-50:]
+            ]
             return {
                 "asr_in_flight": self.asr_in_flight,
+                "asr_in_flight_ids": in_flight_ids,
+                "asr_requests": recent_requests,
                 "asr_total": self.asr_total,
                 "asr_completed": self.asr_completed,
                 "asr_aborted": self.asr_aborted,
@@ -80,6 +97,7 @@ class ProviderState:
                 "tts_total": self.tts_total,
                 "tts_seconds": self.tts_seconds,
                 "asr_status": self.asr_status,
+                "tts_status": self.tts_status,
                 "pending_asr_delays": list(self.asr_delays),
             }
 
@@ -113,7 +131,11 @@ class Handler(BaseHTTPRequestHandler):
 
     def _authorized(self) -> bool:
         header = self.headers.get("Authorization", "")
-        return header == f"Bearer {FAKE_KEY}"
+        if header == f"Bearer {FAKE_KEY}":
+            return True
+        with STATE.lock:
+            extra = list(STATE.accepted_api_keys)
+        return any(header == f"Bearer {key}" for key in extra if key)
 
     def _send_json(self, code: int, payload: dict) -> None:
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
@@ -147,6 +169,16 @@ class Handler(BaseHTTPRequestHandler):
                     STATE.asr_delays = [float(x) for x in (data["asr_delays"] or [])]
                 if "asr_status" in data:
                     STATE.asr_status = int(data["asr_status"])
+                if "asr_error_body" in data:
+                    STATE.asr_error_body = str(data["asr_error_body"] or "")
+                if "tts_status" in data:
+                    STATE.tts_status = int(data["tts_status"])
+                if "tts_error_body" in data:
+                    STATE.tts_error_body = str(data["tts_error_body"] or "")
+                if "accepted_api_keys" in data:
+                    STATE.accepted_api_keys = [
+                        str(x) for x in (data["accepted_api_keys"] or []) if x
+                    ]
                 if "tts_seconds" in data:
                     STATE.tts_seconds = float(data["tts_seconds"])
                 if "transcript" in data:
@@ -162,10 +194,19 @@ class Handler(BaseHTTPRequestHandler):
 
         if path == "/v1/audio/transcriptions":
             with STATE.lock:
+                req_id = STATE.next_asr_req_id
+                STATE.next_asr_req_id += 1
+                STATE.asr_requests[req_id] = {
+                    "id": req_id,
+                    "state": "in_flight",
+                    "started_at": time.monotonic(),
+                    "ended_at": None,
+                }
                 STATE.asr_in_flight += 1
                 STATE.asr_total += 1
                 delay = STATE.asr_delays.pop(0) if STATE.asr_delays else 0.0
                 status = STATE.asr_status
+                error_body = STATE.asr_error_body
                 transcript = STATE.transcript
             aborted = False
             try:
@@ -175,23 +216,35 @@ class Handler(BaseHTTPRequestHandler):
                         if _client_disconnected(self.connection):
                             aborted = True
                             break
-                        time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
+                        time.sleep(min(0.02, max(0.0, deadline - time.monotonic())))
                 if aborted:
                     with STATE.lock:
                         STATE.asr_aborted += 1
+                        STATE.asr_requests[req_id]["state"] = "aborted"
+                        STATE.asr_requests[req_id]["ended_at"] = time.monotonic()
                     return
                 if status != 200:
-                    self._reject(status, f"simulated ASR error {status}")
+                    with STATE.lock:
+                        STATE.asr_requests[req_id]["state"] = "error"
+                        STATE.asr_requests[req_id]["ended_at"] = time.monotonic()
+                    self._reject(status, error_body or f"simulated ASR error {status}")
                     return
                 self._send_json(200, {"text": transcript})
                 with STATE.lock:
                     STATE.asr_completed += 1
+                    STATE.asr_requests[req_id]["state"] = "completed"
+                    STATE.asr_requests[req_id]["ended_at"] = time.monotonic()
             except (BrokenPipeError, ConnectionResetError):
                 with STATE.lock:
                     STATE.asr_aborted += 1
+                    STATE.asr_requests[req_id]["state"] = "aborted"
+                    STATE.asr_requests[req_id]["ended_at"] = time.monotonic()
             finally:
                 with STATE.lock:
                     STATE.asr_in_flight = max(0, STATE.asr_in_flight - 1)
+                    if STATE.asr_requests[req_id]["state"] == "in_flight":
+                        STATE.asr_requests[req_id]["state"] = "error"
+                        STATE.asr_requests[req_id]["ended_at"] = time.monotonic()
             return
 
         if path == "/v1/chat/completions":
@@ -223,6 +276,11 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/v1/audio/speech":
             with STATE.lock:
                 STATE.tts_total += 1
+                tts_status = STATE.tts_status
+                tts_error_body = STATE.tts_error_body
+            if tts_status != 200:
+                self._reject(tts_status, tts_error_body or f"simulated TTS error {tts_status}")
+                return
             wav_bytes = STATE.get_wav()
             self.send_response(200)
             self.send_header("Content-Type", "audio/wav")

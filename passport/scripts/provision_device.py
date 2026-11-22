@@ -22,7 +22,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from passport_server.device_auth import hash_ota_secret, normalize_device_id
-from passport_server.fs_utils import atomic_write_private
+from passport_server.fs_utils import atomic_write_private, locked_file
 
 DEFAULT_DEVICES_FILE = ROOT / "runtime" / "devices.yaml"
 
@@ -55,15 +55,9 @@ def _format_ota_url(ota_base: str, ota_secret: str) -> str:
 
 def _cmd_add(args: argparse.Namespace) -> None:
     devices_file = Path(args.devices_file)
-    devices = _load_registry(devices_file)
     dev_id = normalize_device_id(args.device_id)
     if not dev_id:
         raise SystemExit("--device-id must be non-empty")
-
-    if any(normalize_device_id(str(d.get("device_id") or "")) == dev_id for d in devices):
-        raise SystemExit(
-            f"Device {dev_id} already exists in {devices_file}; use 'rotate' to replace its secret."
-        )
 
     ota_secret = args.secret.strip() if args.secret else secrets.token_urlsafe(24)
     entry: Dict[str, Any] = {
@@ -76,8 +70,14 @@ def _cmd_add(args: argparse.Namespace) -> None:
     if args.name:
         entry["name"] = args.name.strip()
 
-    devices.append(entry)
-    _save_registry(devices_file, devices)
+    with locked_file(devices_file):
+        devices = _load_registry(devices_file)
+        if any(normalize_device_id(str(d.get("device_id") or "")) == dev_id for d in devices):
+            raise SystemExit(
+                f"Device {dev_id} already exists in {devices_file}; use 'rotate' to replace its secret."
+            )
+        devices.append(entry)
+        _save_registry(devices_file, devices)
 
     ota_url = _format_ota_url(args.ota_base, ota_secret)
     if args.json:
@@ -107,21 +107,23 @@ def _cmd_add(args: argparse.Namespace) -> None:
 
 def _cmd_rotate(args: argparse.Namespace) -> None:
     devices_file = Path(args.devices_file)
-    devices = _load_registry(devices_file)
     dev_id = normalize_device_id(args.device_id)
-    target = None
-    for entry in devices:
-        if normalize_device_id(str(entry.get("device_id") or "")) == dev_id:
-            target = entry
-            break
-    if target is None:
-        raise SystemExit(f"Device {dev_id} not found in {devices_file}")
-
     ota_secret = args.secret.strip() if args.secret else secrets.token_urlsafe(24)
-    target["ota_secret_sha256"] = hash_ota_secret(ota_secret)
-    target.pop("ota_secret", None)
-    target["enabled"] = True
-    _save_registry(devices_file, devices)
+
+    with locked_file(devices_file):
+        devices = _load_registry(devices_file)
+        target = None
+        for entry in devices:
+            if normalize_device_id(str(entry.get("device_id") or "")) == dev_id:
+                target = entry
+                break
+        if target is None:
+            raise SystemExit(f"Device {dev_id} not found in {devices_file}")
+
+        target["ota_secret_sha256"] = hash_ota_secret(ota_secret)
+        target.pop("ota_secret", None)
+        target["enabled"] = True
+        _save_registry(devices_file, devices)
 
     ota_url = _format_ota_url(args.ota_base, ota_secret)
     if args.json:
@@ -143,23 +145,25 @@ def _cmd_rotate(args: argparse.Namespace) -> None:
 
 def _cmd_revoke(args: argparse.Namespace) -> None:
     devices_file = Path(args.devices_file)
-    devices = _load_registry(devices_file)
     dev_id = normalize_device_id(args.device_id)
-    updated = False
-    for entry in devices:
-        if normalize_device_id(str(entry.get("device_id") or "")) == dev_id:
-            entry["enabled"] = False
-            updated = True
-            break
-    if not updated:
-        raise SystemExit(f"Device {dev_id} not found in {devices_file}")
-    _save_registry(devices_file, devices)
+    with locked_file(devices_file):
+        devices = _load_registry(devices_file)
+        updated = False
+        for entry in devices:
+            if normalize_device_id(str(entry.get("device_id") or "")) == dev_id:
+                entry["enabled"] = False
+                updated = True
+                break
+        if not updated:
+            raise SystemExit(f"Device {dev_id} not found in {devices_file}")
+        _save_registry(devices_file, devices)
     print(f"Revoked device: {dev_id}")
 
 
 def _cmd_list(args: argparse.Namespace) -> None:
     devices_file = Path(args.devices_file)
-    devices = _load_registry(devices_file)
+    with locked_file(devices_file):
+        devices = _load_registry(devices_file)
     if not devices:
         print(f"No devices provisioned in {devices_file}")
         return

@@ -22,7 +22,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from passport_server.fs_utils import atomic_write_private
+from passport_server.fs_utils import atomic_write_private, ensure_private_secret_file
 
 REAL_DEFAULT_CONFIG = ROOT / "config" / "server.config.yaml"
 DEMO_DEFAULT_CONFIG = ROOT / "config" / "demo.config.yaml"
@@ -43,7 +43,16 @@ def _is_valid_auth_key(value: str) -> bool:
     return True
 
 
-def _resolve_auth_key(config_auth_key: str) -> str:
+def _assert_not_real_runtime_path(path_value: Path, label: str) -> None:
+    real_runtime = (ROOT / "runtime").resolve()
+    candidate = Path(path_value).resolve()
+    if candidate == real_runtime or real_runtime in candidate.parents:
+        sys.exit(
+            f"Refusing demo-mode access to real runtime directory for {label}: {candidate}"
+        )
+
+
+def _resolve_auth_key(config_auth_key: str, mode: str) -> str:
     env_key = os.environ.get("PASSPORT_AUTH_KEY", "").strip()
     if env_key:
         if not _is_valid_auth_key(env_key):
@@ -55,22 +64,29 @@ def _resolve_auth_key(config_auth_key: str) -> str:
     if _is_valid_auth_key(config_auth_key):
         return config_auth_key.strip()
 
-    key_file = Path(
-        os.environ.get("PASSPORT_AUTH_FILE") or (ROOT / "runtime" / "auth_key")
-    )
-    if key_file.is_file():
-        auth_key = key_file.read_text(encoding="utf-8").strip()
-        if not _is_valid_auth_key(auth_key):
-            sys.exit(f"Existing auth_key file {key_file} is invalid or shorter than 32 chars")
-        return auth_key
-
-    auth_key = secrets.token_hex(32)
-    atomic_write_private(key_file, auth_key + "\n", mode=0o600)
-    return auth_key
+    default_dir = ROOT / ("runtime-demo" if mode == "demo" else "runtime")
+    key_file = Path(os.environ.get("PASSPORT_AUTH_FILE") or (default_dir / "auth_key"))
+    if mode == "demo":
+        _assert_not_real_runtime_path(key_file, "PASSPORT_AUTH_FILE")
+    try:
+        return ensure_private_secret_file(
+            key_file,
+            lambda: secrets.token_hex(32),
+            _is_valid_auth_key,
+            mode=0o600,
+        )
+    except ValueError as exc:
+        sys.exit(f"Existing auth_key file {key_file} is invalid or shorter than 32 chars ({exc})")
 
 
 def _apply_common_server_overrides(config: dict, mode: str) -> None:
-    server = config.setdefault("server", {})
+    server = config.get("server")
+    if not isinstance(server, dict):
+        if mode == "real":
+            sys.exit("PASSPORT_MODE=real requires a 'server' mapping in configuration.")
+        server = {}
+        config["server"] = server
+
     if os.environ.get("PASSPORT_BIND", "").strip():
         server["ip"] = os.environ["PASSPORT_BIND"].strip()
     if os.environ.get("PASSPORT_WS_BIND_PORT", "").strip():
@@ -82,23 +98,48 @@ def _apply_common_server_overrides(config: dict, mode: str) -> None:
     if os.environ.get("PASSPORT_PUBLIC_HTTP", "").strip():
         server["vision_explain"] = os.environ["PASSPORT_PUBLIC_HTTP"].strip()
 
-    auth = server.setdefault("auth", {})
-    if "enabled" not in auth:
-        auth["enabled"] = True
-    if not auth.get("enabled"):
-        print(
-            "WARNING: server.auth.enabled is false; OTA and WebSocket endpoints will not verify device credentials.",
-            file=sys.stderr,
-        )
+    auth = server.get("auth")
+    if mode == "real":
+        if not isinstance(auth, dict) or auth.get("enabled") is not True:
+            sys.exit(
+                "PASSPORT_MODE=real requires server.auth.enabled: true; refusing to start "
+                "with device authentication disabled or omitted."
+            )
+    else:
+        if auth is None:
+            auth = {}
+            server["auth"] = auth
+        elif not isinstance(auth, dict):
+            sys.exit("server.auth must be a YAML mapping")
+        if "enabled" in auth and auth.get("enabled") is not True:
+            sys.exit(
+                "PASSPORT_MODE=demo requires server.auth.enabled: true; refusing to "
+                "disable device authentication."
+            )
+        auth.setdefault("enabled", True)
 
+    default_devices = ROOT / ("runtime-demo" if mode == "demo" else "runtime") / "devices.yaml"
     devices_file_env = os.environ.get("PASSPORT_DEVICES_FILE", "").strip()
     if devices_file_env:
         auth["devices_file"] = devices_file_env
     elif not auth.get("devices_file") and not auth.get("devices"):
-        auth["devices_file"] = str(ROOT / "runtime" / "devices.yaml")
+        auth["devices_file"] = str(default_devices)
+
+    if mode == "demo" and auth.get("devices_file"):
+        _assert_not_real_runtime_path(Path(str(auth["devices_file"])), "devices_file")
 
     if os.environ.get("PASSPORT_AUTH_EXPIRE_SECONDS", "").strip():
         auth["expire_seconds"] = int(os.environ["PASSPORT_AUTH_EXPIRE_SECONDS"].strip())
+
+    log_level_env = os.environ.get("PASSPORT_LOG_LEVEL", "").strip()
+    if log_level_env:
+        config.setdefault("log", {})["log_level"] = log_level_env
+
+    log_dir_env = os.environ.get("PASSPORT_LOG_DIR", "").strip()
+    if log_dir_env:
+        if mode == "demo":
+            _assert_not_real_runtime_path(Path(log_dir_env), "PASSPORT_LOG_DIR")
+        config.setdefault("log", {})["log_dir"] = log_dir_env
 
     # Allow testing that allowlisted device IDs never bypass token verification.
     if mode == "demo" and os.environ.get("PASSPORT_TEST_ALLOWED_DEVICES", "").strip():
@@ -166,9 +207,16 @@ def main() -> None:
     if not isinstance(config, dict):
         sys.exit(f"Configuration file {source_path} did not parse to a YAML mapping")
 
-    existing_auth_key = str(config.get("server", {}).get("auth_key") or "")
-    config.setdefault("server", {})["auth_key"] = _resolve_auth_key(existing_auth_key)
     _apply_common_server_overrides(config, mode)
+
+    if mode == "demo":
+        _assert_not_real_runtime_path(server_home / "data" / ".config.yaml", "XIAOZHI_HOME")
+        log_dir_cfg = config.get("log", {}).get("log_dir")
+        if isinstance(log_dir_cfg, str) and log_dir_cfg.strip():
+            _assert_not_real_runtime_path(server_home / log_dir_cfg.strip(), "log.log_dir")
+
+    existing_auth_key = str(config.get("server", {}).get("auth_key") or "")
+    config["server"]["auth_key"] = _resolve_auth_key(existing_auth_key, mode)
 
     if mode == "demo":
         _apply_demo_providers(config)

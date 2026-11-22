@@ -12,16 +12,19 @@
    - 只有在 `devices.yaml` 中已登记且启用的设备，并在 OTA 请求提供匹配的 per-device 凭据（设备专属 OTA 路径 `/xiaozhi/ota/d/<secret>/`、`X-OTA-Secret` 或 `Authorization: Bearer <secret>`）和 `Device-Id` / `Client-Id` 时才签发 WebSocket token。
    - WebSocket token 签名同时绑定 `client_id`、`device_id`、`ts` 与设备 `ota_secret_sha256`，并校验过期时间。
    - 彻底移除上游 `allowed_devices` 命中后跳过 token 校验的绕过，以及 `/mcp/vision/explain` 上的 `web_test_client` 硬编码后门。
-2. **日志源头脱敏**（[redaction.py](passport_server/redaction.py)）：
-   - 在鉴权后、进入上游 `ConnectionHandler` 前清除 `Authorization` 等敏感请求头；禁用 `aiohttp` 默认 access log，防止设备专属 OTA 路径写入日志；loguru 挂载全局脱敏 patcher 并将文件日志 `diagnose=False`；stdlib 日志挂载脱敏过滤器，拒绝并拦截带凭据的 query 参数。
+2. **日志源头脱敏与最小化错误记录**（[redaction.py](passport_server/redaction.py)、[patches.py](passport_server/patches.py)）：
+   - 在鉴权后、进入上游 `ConnectionHandler` 前清除 `Authorization` 等敏感请求头；禁用 `aiohttp` 默认 access log，防止设备专属 OTA 路径写入日志。
+   - loguru 挂载全局脱敏 patcher 并对 stdout 与文件日志均关闭 `diagnose=False` / `backtrace=False`；stdlib 日志挂载脱敏过滤器；运行时注册配置中的供应商密钥与 URL 用户信息。
+   - OpenAI ASR / TTS 失败仅记录状态码、脱敏端点（不含 `userinfo` 与查询参数）及响应字节数，**不原样打印供应商响应正文**；MCP 发送调试日志仅记录 `method` 与 `id`，不打印含 Vision JWT 的完整载荷。
 3. **非阻塞、可超时与可取消的 OpenAI ASR**（[async_openai_asr.py](passport_server/async_openai_asr.py)）：
    - 用基于 `httpx.AsyncClient` 的异步实现替换上游在事件循环内阻塞的同步 `requests.post()`，强制配置连接/读取/写入/连接池和总超时（默认 `5/15/10/5/20` 秒）。
+   - 音频上传直接以限长内存 WAV 缓冲完成；当显式保留本地音频文件时，将磁盘检查与写盘移入 `asyncio.to_thread()`，避免阻塞共享事件循环。
    - 手动录音 `listen.stop` 异步派发任务，不阻塞其他会话的 OTA/WebSocket/hello；`abort` 或断线时立即取消在途 ASR 请求。
    - `hello` 阶段等待连接后台组件与音频线程就绪后再返回服务端 `hello`，消除首轮音频窗口竞争；OTA 响应显式下发 `websocket.version: 1`，避免切服时保留旧协议版本。
-4. **真实配置与演示模式分离、原子写入与信号转发**（[write_config.py](scripts/write_config.py)、[entrypoint.sh](scripts/entrypoint.sh)）：
-   - 默认 `PASSPORT_MODE=real`，读取只读模板 `passport/config/server.config.yaml` 渲染 `data/.config.yaml`；若真实配置缺失则报错退出，**绝不**静默覆盖或切回假供应商。
-   - 演示/契约测试需显式启用 `PASSPORT_MODE=demo` 或使用 `docker-compose.demo.yml`。
-   - `auth_key`、`devices.yaml` 和生成的 `data/.config.yaml` 均通过 `tempfile.mkstemp` + `os.fchmod(0o600)` + `os.replace` 原子写入。
+4. **真实配置与演示模式隔离、强制鉴权、跨进程锁与原子写入**（[write_config.py](scripts/write_config.py)、[fs_utils.py](passport_server/fs_utils.py)、[entrypoint.sh](scripts/entrypoint.sh)）：
+   - 默认 `PASSPORT_MODE=real`，读取只读模板 `passport/config/server.config.yaml` 渲染 `data/.config.yaml`；若真实配置缺失或 `server.auth.enabled` 未显式为 `true`，在配置渲染及运行时初始化阶段均拒绝启动（fail closed），**绝不**跳过设备鉴权或静默切回假供应商。
+   - 本地演示（`run_isolated.sh`）使用 `passport/runtime-demo/`，Compose 演示（`docker-compose.demo.yml`）使用独立项目名 `folotoy-passport-demo` 与 `passport/runtime-compose-demo/`，**绝不读取或删除真实 `passport/runtime/devices.yaml`、`auth_key` 或真实配置**。
+   - `auth_key`、`devices.yaml` 与 `data/.config.yaml` 均通过 `tempfile.mkstemp` + `os.fchmod(0o600)` + `os.replace` 原子写入，并对 `devices.yaml` 和首次 `auth_key` 创建使用侧车锁文件 `flock` 跨进程加锁。
    - 容器入口通过 `exec python /opt/passport/passport_server/runner.py` 接管 PID 1，确保收到 `SIGTERM` 优雅清理退出。
    - Silero VAD 直接使用固定上游仓库内自带的 `silero_vad.onnx`（启动与构建时校验其 SHA-256 摘要），配合 `onnxruntime` 运行，不再安装 `silero_vad` 或拉入 `torch`。
 
@@ -58,13 +61,13 @@
 
 演示模式使用本地 `fake_provider.py`（只返回固定文字和正弦波 WAV，不是语音理解或真实合成音色），仅用于隔离契约/回归测试：
 
-- **本地无 Docker 运行**（启动 pinned 上游服务 + `fake_provider.py`，运行契约测试与完整回归测试）：
+- **本地无 Docker 运行**（启动 pinned 上游服务 + `fake_provider.py`，运行契约测试与完整回归测试；所有演示状态写入隔离目录 `passport/runtime-demo/`，不会修改真实 `passport/runtime/devices.yaml`）：
 
   ```sh
   sh passport/scripts/run_isolated.sh
   ```
 
-- **Docker 演示模式**：
+- **Docker 演示模式**（使用独立项目名 `folotoy-passport-demo` 与独立目录 `passport/runtime-compose-demo/`，不挂载真实 `./runtime`）：
 
   ```sh
   cd passport
@@ -104,13 +107,19 @@
 ## 网络与安全部署建议
 
 - 默认 Compose 仅将 `18010`（WebSocket）和 `18013`（HTTP OTA/Vision）发布在宿主机 `127.0.0.1` 上。注意：在 Docker Engine 低于 `28.0.0` 的环境中，同二层网络主机的回环端口隔离较弱，切勿直接将未保护的端口暴露到不可信局域网或公网。
-- **生产/局域网设备接入建议**：在 Passport 前放置反向代理（Caddy/Nginx/Traefik）提供 **HTTPS（`/xiaozhi/ota/`）与 WSS（`/xiaozhi/v1/`）**，或限制在受控私网/VPN 内访问。明文 `http://` / `ws://` 会使路径中的 OTA secret、响应中的 Bearer token 和语音流在网络上明文传输，并存在中间人篡改风险。
-- 本仓库所有示例模板、脚本和文档均不包含真实供应商密钥或测试 token；`passport/runtime/`、`passport/config/server.config.yaml` 和 `passport/.env` 均已加入 `.gitignore`。
+- **生产/局域网设备接入建议**：在 Passport 前放置反向代理提供 **HTTPS（`/xiaozhi/ota/`）与 WSS（`/xiaozhi/v1/`）**，或限制在受控私网/VPN 内访问。明文 `http://` / `ws://` 会使路径中的 OTA secret、响应中的 Bearer token 和语音流在网络上明文传输，并存在中间人篡改风险。
+- **反向代理日志隔离（必须采用模板配置，勿使用默认 `combined` 格式）**：
+  - 设备专属 OTA URL 形如 `/xiaozhi/ota/d/<device-secret>/`，默认反向代理访问日志会把完整 URI 中的凭据落盘。请直接采用仓库提供的配置模板：
+    - Nginx：[proxy/nginx-passport.conf.example](proxy/nginx-passport.conf.example)（对 `/xiaozhi/ota/d/` 关闭 `access_log` 并将 `error_log` 重定向至 `/dev/null emerg`，通过内部重写提取到 `X-OTA-Secret` 请求头后转发给 `/xiaozhi/ota/`；其余路径使用 `map` + `log_format passport_safe` 脱敏 URI 与 `Referer`，并清除 `X-Original-URI` / `X-Original-URL` / `X-Rewrite-URL` / `X-Forwarded-Uri` / `X-Envoy-Original-Path` / `Referer`）。
+    - Caddy v2：[proxy/Caddyfile.example](proxy/Caddyfile.example)（对 `/xiaozhi/ota/d/*` 配置 `log_skip`，其余路由通过 `format filter` 脱敏 `request>uri`、`request>orig_uri` 与认证请求头，并剥离链路追踪 URI 头）。
+  - 若上游还接入了 WAF、OpenTelemetry 或 APM 探针，需同时禁用或脱敏 `/xiaozhi/ota/d/*` 的 `http.target`、`url.path`、`url.full`、`http.url` 字段。
+- **real 模式不可关闭鉴权**：`PASSPORT_MODE=real` 及运行时入口会强制检查 `server.auth.enabled: true` 与有效 `auth_key` / `devices_file`，关闭或缺失鉴权将拒绝启动。
+- 本仓库所有示例模板、脚本和文档均不包含真实供应商密钥或测试 token；`passport/runtime/`、`passport/runtime-demo/`、`passport/runtime-compose-demo/`、`passport/config/server.config.yaml` 和 `passport/.env` 均已加入 `.gitignore`。
 
 ## 验证边界
 
 | 层级 | 已验证内容 | 边界说明 |
 | --- | --- | --- |
-| 真实上游 Python 进程 + 本地假供应商 | 已通过 `run_isolated.sh` 实跑 `contract_test.py` 与 `regression_test.py`：OTA 预配鉴权/拒绝、`allowed_devices` 不免验、过期与吊销拒绝、日志脱敏（stdout + 文件日志）、异步 ASR 超时与跨会话不阻塞、`abort` 取消、0 ms 首轮、严格打断与恢复、异常断线重连、`PASSPORT_MODE=real` 重启保持配置、`0600` 原子写入与 `SIGTERM` 退出 | 依赖本地假供应商，不代表真实 ASR/LLM/TTS 识别与合成质量 |
-| Docker 构建与容器启动 | 已更新 `Dockerfile`、`entrypoint.sh`、`docker-compose.yml` 与 `docker-compose.demo.yml` | 若当前运行环境未安装 Docker daemon，则未实际构建或启动容器 |
+| 真实上游 Python 进程 + 本地假供应商 | 已通过 `run_isolated.sh` 实跑 `contract_test.py` 与 `regression_test.py`：隔离目录不修改真实 `runtime/` 状态、OTA 预配鉴权/拒绝、`allowed_devices` 不免验、real 模式关闭鉴权拒绝启动、过期/并发吊销锁定、反向代理配置解析与本地代理日志隔离、stdout 与文件日志在 INFO/DEBUG 及 ASR/TTS 失败路径下强制存在且零泄漏、内存 WAV 与非阻塞慢盘 ASR、`abort` 及断线快速取消、0 ms 首轮、长音频基线对照打断与完整尾帧观察、重连与 `SIGTERM` 退出 | 依赖本地假供应商与进程内 HTTP 代理替身，不代表真实 ASR/LLM/TTS 识别与合成质量 |
+| Docker 构建、Compose 与宿主机 Nginx/Caddy | 已更新 `Dockerfile`、`entrypoint.sh`、`docker-compose.yml`、`docker-compose.demo.yml` 与代理配置模板 | 当前环境无 Docker daemon 及 `nginx`/`caddy` 二进制，未实跑容器构建与真实 `nginx -t` / 代理进程 |
 | 真机端到端 | 未做 | 设备实际刷入 SHA 未知，仍需在真机上完成配网、OTA、首轮录音、播放、打断、重连与官方回退验收 |

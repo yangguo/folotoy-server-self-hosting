@@ -1,19 +1,26 @@
 """Ordered runtime patches applied on top of pinned xiaozhi-server v0.9.8."""
 
 import asyncio
-import glob
 import json
 import os
 import time
 from typing import Optional
+from urllib.parse import urlsplit
 
+import requests
 from aiohttp import web
 
-from passport_server.device_auth import PassportDeviceAuth, normalize_device_id
+from passport_server.device_auth import (
+    PassportDeviceAuth,
+    normalize_device_id,
+    validate_runtime_auth_config,
+)
 from passport_server.redaction import (
     has_sensitive_query_params,
     install_stdlib_redaction,
     redact_text,
+    register_secrets_from_config,
+    safe_endpoint_label,
     sanitize_url_or_path,
     strip_sensitive_ws_headers,
 )
@@ -64,6 +71,7 @@ def patch_logging() -> None:
             config = cache_manager.get(CacheType.CONFIG, "main_config")
             if config is None:
                 config = asyncio.run(load_config())
+        register_secrets_from_config(config)
         log_config = config["log"]
         if not cfg_logger._logger_initialized:
             logger.configure(
@@ -98,6 +106,8 @@ def patch_logging() -> None:
                 format=log_format,
                 level=log_level,
                 filter=safe_formatter,
+                backtrace=False,
+                diagnose=False,
             )
             log_file_path = os.path.join(log_dir, log_file)
             logger.add(
@@ -127,6 +137,88 @@ def patch_openai_asr() -> None:
     from passport_server.async_openai_asr import AsyncOpenAIASRProvider
 
     openai_asr.ASRProvider = AsyncOpenAIASRProvider
+
+
+def patch_mcp_and_provider_logging() -> None:
+    """Scrub Vision JWT from MCP DEBUG logs, TTS error bodies, and LLM URL userinfo."""
+    import core.providers.llm.openai.openai as llm_openai
+    import core.providers.tools.device_mcp as device_mcp
+    import core.providers.tools.device_mcp.mcp_handler as mcp_handler
+    import core.providers.tts.openai as tts_openai
+
+    async def safe_send_mcp_message(conn, payload: dict):
+        if not conn.features.get("mcp"):
+            mcp_handler.logger.bind(tag=mcp_handler.TAG).warning(
+                "客户端不支持MCP，无法发送MCP消息"
+            )
+            return
+        message = json.dumps({"type": "mcp", "payload": payload})
+        msg_kind = payload.get("method") if isinstance(payload, dict) else None
+        if not msg_kind and isinstance(payload, dict):
+            if "result" in payload:
+                msg_kind = "result"
+            elif "error" in payload:
+                msg_kind = "error"
+            else:
+                msg_kind = "unknown"
+        msg_id = payload.get("id") if isinstance(payload, dict) else None
+        try:
+            await conn.websocket.send(message)
+            mcp_handler.logger.bind(tag=mcp_handler.TAG).debug(
+                f"成功发送MCP消息: method={msg_kind}, id={msg_id}"
+            )
+        except Exception as exc:
+            mcp_handler.logger.bind(tag=mcp_handler.TAG).error(
+                f"发送MCP消息失败: method={msg_kind}, id={msg_id}, error_type={type(exc).__name__}"
+            )
+
+    async def safe_tts_text_to_speak(self, text, output_file):
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+        }
+        data = {
+            "model": self.model,
+            "input": text,
+            "voice": self.voice,
+            "response_format": self.audio_file_type,
+            "speed": self.speed,
+        }
+        safe_endpoint = safe_endpoint_label(str(self.api_url or ""))
+        try:
+            response = requests.post(
+                self.api_url, json=data, headers=headers, timeout=self.tts_timeout
+            )
+        except requests.RequestException as exc:
+            raise RuntimeError(
+                f"OpenAI TTS请求异常: endpoint={safe_endpoint}, error_type={type(exc).__name__}"
+            ) from None
+        if response.status_code == 200:
+            if output_file:
+                with open(output_file, "wb") as audio_file:
+                    audio_file.write(response.content)
+                return None
+            return response.content
+        raise Exception(
+            f"OpenAI TTS请求失败: status={response.status_code}, "
+            f"endpoint={safe_endpoint}, response_bytes={len(response.content)}"
+        )
+
+    def safe_apply_thinking_disabled(self, request_params: dict):
+        parsed_url = urlsplit(str(self.base_url or ""))
+        domain = parsed_url.hostname or ""
+        for disabled_domain, params in llm_openai.THINKING_DISABLED_DOMAINS.items():
+            if disabled_domain in domain:
+                request_params.setdefault("extra_body", {}).update(params)
+                llm_openai.logger.bind(tag=llm_openai.TAG).info(
+                    f"为域名 {domain} 禁用思考模式，参数: {params}"
+                )
+                break
+
+    mcp_handler.send_mcp_message = safe_send_mcp_message
+    device_mcp.send_mcp_message = safe_send_mcp_message
+    tts_openai.TTSProvider.text_to_speak = safe_tts_text_to_speak
+    llm_openai.LLMProvider._apply_thinking_disabled = safe_apply_thinking_disabled
 
 
 def patch_abort_and_listen_and_hello() -> None:
@@ -284,7 +376,9 @@ def patch_ota_and_http_server() -> None:
     original_vision_init = VisionHandler.__init__
 
     def patched_ota_init(self, config: dict):
+        validate_runtime_auth_config(config)
         original_ota_init(self, config)
+        self.auth_enable = True
         self.device_auth = PassportDeviceAuth(config)
         if self.allowed_devices:
             self.logger.bind(tag=TAG).warning(
@@ -336,23 +430,20 @@ def patch_ota_and_http_server() -> None:
                     self, 400, "missing device-id or client-id"
                 )
 
-            if self.auth_enable:
-                ota_secret = _extract_ota_secret(request)
-                ok, entry, reason = self.device_auth.authenticate_ota(
-                    device_id=device_id,
-                    client_id=client_id,
-                    ota_secret=ota_secret,
+            ota_secret = _extract_ota_secret(request)
+            ok, entry, reason = self.device_auth.authenticate_ota(
+                device_id=device_id,
+                client_id=client_id,
+                ota_secret=ota_secret,
+            )
+            if not ok or entry is None:
+                status = 401 if reason == "missing_credential" else 403
+                self.logger.bind(tag=TAG).warning(
+                    f"拒绝未授权OTA请求: device_id={device_id}, reason={reason}, path={safe_path}"
                 )
-                if not ok or entry is None:
-                    status = 401 if reason == "missing_credential" else 403
-                    self.logger.bind(tag=TAG).warning(
-                        f"拒绝未授权OTA请求: device_id={device_id}, reason={reason}, path={safe_path}"
-                    )
-                    return _ota_error_response(
-                        self, status, "device authentication failed"
-                    )
-            else:
-                entry = self.device_auth.get_device(device_id)
+                return _ota_error_response(
+                    self, status, "device authentication failed"
+                )
 
             data_json = {}
             try:
@@ -434,11 +525,9 @@ def patch_ota_and_http_server() -> None:
                     "subscribe_topic": f"devices/p2p/{mac_address_safe}",
                 }
             else:
-                token = ""
-                if self.auth_enable and entry is not None:
-                    token = self.device_auth.generate_ws_token(
-                        entry, client_id=client_id, device_id=device_id
-                    )
+                token = self.device_auth.generate_ws_token(
+                    entry, client_id=client_id, device_id=device_id
+                )
                 ws_version = int(self.config.get("xiaozhi", {}).get("version", 1))
                 return_json["websocket"] = {
                     "url": self._get_websocket_url(local_ip, websocket_port),
@@ -462,7 +551,9 @@ def patch_ota_and_http_server() -> None:
                         )
                         break
             except Exception as exc:
-                self.logger.bind(tag=TAG).error(f"检查固件版本时出错: {exc}")
+                self.logger.bind(tag=TAG).error(
+                    f"检查固件版本时出错: {redact_text(str(exc))}"
+                )
 
             response = web.Response(
                 text=json.dumps(return_json, separators=(",", ":")),
@@ -482,6 +573,7 @@ def patch_ota_and_http_server() -> None:
         return resp
 
     def patched_vision_init(self, config: dict):
+        validate_runtime_auth_config(config)
         original_vision_init(self, config)
         self.device_auth = PassportDeviceAuth(config)
 
@@ -578,7 +670,9 @@ def patch_websocket_server() -> None:
     original_ws_init = WebSocketServer.__init__
 
     def patched_ws_init(self, config: dict):
+        validate_runtime_auth_config(config)
         original_ws_init(self, config)
+        self.auth_enable = True
         self.device_auth = PassportDeviceAuth(self.config)
         if self.allowed_devices:
             self.logger.bind(tag=TAG).warning(
@@ -602,8 +696,6 @@ def patch_websocket_server() -> None:
         return result
 
     async def patched_handle_auth(self, websocket):
-        if not self.auth_enable:
-            return
         headers = _lowercase_headers(websocket)
         device_id = normalize_device_id(headers.get("device-id", ""))
         client_id = headers.get("client-id", "").strip()
@@ -725,6 +817,7 @@ def apply_all_patches() -> None:
         return
     patch_logging()
     patch_openai_asr()
+    patch_mcp_and_provider_logging()
     patch_abort_and_listen_and_hello()
     patch_connection_handler()
     patch_ota_and_http_server()

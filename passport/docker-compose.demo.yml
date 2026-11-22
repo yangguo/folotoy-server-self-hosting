@@ -2,7 +2,12 @@
 # Usage:
 #   docker compose -f docker-compose.yml -f docker-compose.demo.yml up --build
 #
+# Uses a separate Compose project name and isolated ./runtime-compose-demo state
+# directory so real ./runtime/devices.yaml, auth_key, and data/.config.yaml are
+# never mounted, modified, or deleted.
 # fake-provider is kept internal to the Compose network (no host port publish).
+name: folotoy-passport-demo
+
 services:
   fake-provider:
     image: python:3.12-slim-bookworm
@@ -17,6 +22,14 @@ services:
     environment:
       PASSPORT_MODE: demo
       PASSPORT_CONFIG_FILE: /opt/passport/config/demo.config.yaml
+      PASSPORT_DEVICES_FILE: /opt/passport/runtime-compose-demo/devices.yaml
+      PASSPORT_AUTH_FILE: /opt/passport/runtime-compose-demo/auth_key
+      PASSPORT_LOG_DIR: /opt/passport/runtime-compose-demo/logs
       PASSPORT_FAKE_BASE: http://fake-provider:18019
       PASSPORT_PUBLIC_WS: ws://127.0.0.1:18010/xiaozhi/v1/
       PASSPORT_PUBLIC_HTTP: http://127.0.0.1:18013/mcp/vision/explain
+    volumes:
+      - ./config:/opt/passport/config:ro
+      - ./runtime-compose-demo:/opt/passport/runtime
+      - ./runtime-compose-demo:/opt/passport/runtime-compose-demo
+      - ./runtime-compose-demo/data:/opt/xiaozhi-esp32-server/data

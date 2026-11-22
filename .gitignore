@@ -1,5 +1,7 @@
 # Passport opt-in runtime (cloned upstream, venv, generated config, local secrets, logs)
 passport/runtime/
+passport/runtime-demo/
+passport/runtime-compose-demo/
 passport/config/server.config.yaml
 passport/.env
 

@@ -13,6 +13,7 @@ Fixes Blocker #1:
 import base64
 import hashlib
 import hmac
+import os
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -50,6 +51,42 @@ def _is_placeholder(value: str) -> bool:
     return not lower or any(lower.startswith(prefix) for prefix in PLACEHOLDER_PREFIXES)
 
 
+def validate_runtime_auth_config(config: dict, mode: Optional[str] = None) -> None:
+    """Fail closed if device authentication is missing, disabled, or misconfigured."""
+    effective_mode = (mode or os.environ.get("PASSPORT_MODE") or "real").strip().lower()
+    if effective_mode not in ("real", "demo"):
+        raise RuntimeError(
+            f"Invalid PASSPORT_MODE={effective_mode!r}; expected 'real' or 'demo'."
+        )
+    if not isinstance(config, dict) or not isinstance(config.get("server"), dict):
+        raise RuntimeError("Passport configuration must define a 'server' mapping.")
+
+    server_cfg = config["server"]
+    auth_cfg = server_cfg.get("auth")
+    if not isinstance(auth_cfg, dict) or auth_cfg.get("enabled") is not True:
+        raise RuntimeError(
+            "Passport requires server.auth.enabled: true; refusing to start with "
+            "device authentication disabled or missing."
+        )
+
+    auth_key = str(server_cfg.get("auth_key") or "").strip()
+    if not auth_key or _is_placeholder(auth_key) or "你" in auth_key:
+        raise RuntimeError("Passport requires a valid non-placeholder server.auth_key.")
+    if effective_mode == "real" and len(auth_key) < 32:
+        raise RuntimeError(
+            "PASSPORT_MODE=real requires server.auth_key to be at least 32 characters."
+        )
+
+    devices_file = auth_cfg.get("devices_file")
+    inline_devices = auth_cfg.get("devices")
+    has_devices_file = isinstance(devices_file, str) and bool(devices_file.strip())
+    has_inline_devices = isinstance(inline_devices, list) and len(inline_devices) > 0
+    if not has_devices_file and not has_inline_devices:
+        raise RuntimeError(
+            "Passport requires server.auth.devices_file or non-empty server.auth.devices."
+        )
+
+
 @dataclass(frozen=True)
 class DeviceRecord:
     """Provisioned Passport device entry."""
@@ -85,7 +122,7 @@ class PassportDeviceAuth:
         self._inline_devices = self._parse_devices_mapping(
             {"devices": auth_cfg.get("devices") or []}, source="inline"
         )
-        self._file_mtime_ns: Optional[int] = None
+        self._file_sig: Optional[Tuple[int, int, int]] = None
         self._file_devices: Dict[str, DeviceRecord] = {}
         self._reload_if_needed(force=True)
 
@@ -132,18 +169,19 @@ class PassportDeviceAuth:
         if self.devices_file is None:
             return
         if not self.devices_file.is_file():
-            if force or self._file_mtime_ns is not None:
+            if force or self._file_sig is not None:
                 self._file_devices = {}
-                self._file_mtime_ns = None
+                self._file_sig = None
             return
         stat = self.devices_file.stat()
-        if not force and stat.st_mtime_ns == self._file_mtime_ns:
+        sig = (stat.st_mtime_ns, stat.st_ino, stat.st_size)
+        if not force and sig == self._file_sig:
             return
         loaded = yaml.safe_load(self.devices_file.read_text(encoding="utf-8"))
         self._file_devices = self._parse_devices_mapping(
             loaded, source=str(self.devices_file)
         )
-        self._file_mtime_ns = stat.st_mtime_ns
+        self._file_sig = sig
 
     def get_device(self, device_id: str) -> Optional[DeviceRecord]:
         """Look up a normalized device record, reloading devices_file on changes."""
