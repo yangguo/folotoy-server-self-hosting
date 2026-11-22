@@ -61,7 +61,7 @@
 
 演示模式使用本地 `fake_provider.py`（只返回固定文字和正弦波 WAV，不是语音理解或真实合成音色），仅用于隔离契约/回归测试：
 
-- **本地无 Docker 运行**（启动 pinned 上游服务 + `fake_provider.py`，运行契约测试与完整回归测试；所有演示状态、日志与演示专用 venv 写入隔离目录 `passport/runtime-demo/`，每次运行先解除已有输出文件的软/硬链接再重建；已有 `passport/runtime/venv` 与上游检出仅以只读方式复用，依赖安装只写入 `passport/runtime-demo/venv`；演示忽略环境中的 `PASSPORT_AUTH_KEY`，只使用 `passport/runtime-demo/auth_key`；不会修改真实 `passport/runtime/devices.yaml`）：
+- **本地无 Docker 运行**（启动 pinned 上游服务 + `fake_provider.py`，运行契约测试与完整回归测试；所有演示状态、日志与演示专用 venv 写入隔离目录 `passport/runtime-demo/`，每次运行先解除已有输出文件的软/硬链接再重建；已有 `passport/runtime/venv` 与上游检出仅以只读方式复用，演示 `pip` 使用 `PIP_CONFIG_FILE=/dev/null` 与 `--isolated` 受控配置并在安装前校验解析目标目录位于 `passport/runtime-demo/venv` 内；演示忽略环境中的 `PASSPORT_AUTH_KEY`，只使用 `passport/runtime-demo/auth_key`；不会修改真实 `passport/runtime/devices.yaml`）：
 
   ```sh
   sh passport/scripts/run_isolated.sh
@@ -110,7 +110,7 @@
 - **生产/局域网设备接入建议**：在 Passport 前放置反向代理提供 **HTTPS（`/xiaozhi/ota/`）与 WSS（`/xiaozhi/v1/`）**，或限制在受控私网/VPN 内访问。明文 `http://` / `ws://` 会使路径中的 OTA secret、响应中的 Bearer token 和语音流在网络上明文传输，并存在中间人篡改风险。
 - **反向代理日志隔离（必须采用模板配置，勿使用默认 `combined` 格式）**：
   - 设备专属 OTA URL 形如 `/xiaozhi/ota/d/<device-secret>/`，默认反向代理访问日志会把完整 URI 中的凭据落盘。请直接采用仓库提供的配置模板：
-    - Nginx：[proxy/nginx-passport.conf.example](proxy/nginx-passport.conf.example)（对 `/xiaozhi/ota/d/` 关闭 `access_log` 并将 `error_log` 重定向至 `/dev/null emerg`，通过内部重写提取到 `X-OTA-Secret` 请求头后转发给 `/xiaozhi/ota/`；其余路径使用 `map` + `log_format passport_safe` 脱敏 URI 与 `Referer`，并清除 `X-Original-URI` / `X-Original-URL` / `X-Rewrite-URL` / `X-Forwarded-Uri` / `X-Envoy-Original-Path` / `Referer`；由于 Nginx 错误日志无法过滤字段且会附加原始 `referrer`，站点级 `if ($passport_unsafe_referer) { return 400; }` 在任何上游/请求体错误之前拒绝含 OTA 秘密路径、userinfo 或查询串的 Referer）。
+    - Nginx：[proxy/nginx-passport.conf.example](proxy/nginx-passport.conf.example)（对 `/xiaozhi/ota/d/` 关闭 `access_log` 并将 `error_log` 重定向至 `/dev/null emerg`，通过内部重写提取到 `X-OTA-Secret` 请求头后转发给 `/xiaozhi/ota/`；其余路径使用 `map` + `log_format passport_safe` 脱敏 URI、省略原始 `Referer`（固定输出 `"-"`），并清除 `X-Original-URI` / `X-Original-URL` / `X-Rewrite-URL` / `X-Forwarded-Uri` / `X-Envoy-Original-Path` / `Referer`；由于 Nginx 错误日志无法过滤字段且会附加原始 `referrer`，站点级 `if ($passport_unsafe_referer) { return 400; }` 采用严格白名单，仅放行空 `Referer` 或裸源站（`scheme://host[:port][/]`），在任何上游/请求体错误之前拒绝字面及等价百分号编码/路径归一化后的 OTA 秘密路径、userinfo 与查询串）。
     - Caddy v2：[proxy/Caddyfile.example](proxy/Caddyfile.example)（对 `/xiaozhi/ota/d/*` 配置 `log_skip`，其余路由通过 `format filter` 脱敏 `request>uri`、`request>orig_uri` 与认证请求头，并剥离链路追踪 URI 头；全局 `log` 选项把 `http.log.error` / `http.handlers.reverse_proxy` 运行时错误日志（后端失败时会带改写前的原始 `request.uri`）从未过滤的默认日志中排除，改写入同样脱敏的 `passport_error.log`）。
   - 若上游还接入了 WAF、OpenTelemetry 或 APM 探针，需同时禁用或脱敏 `/xiaozhi/ota/d/*` 的 `http.target`、`url.path`、`url.full`、`http.url` 字段。
 - **real 模式不可关闭鉴权**：`PASSPORT_MODE=real` 及运行时入口会强制检查 `server.auth.enabled: true` 与有效 `auth_key` / `devices_file`，关闭或缺失鉴权将拒绝启动。

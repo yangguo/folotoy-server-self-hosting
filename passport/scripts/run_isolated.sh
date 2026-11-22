@@ -25,9 +25,11 @@ SERVER="$SRC/main/xiaozhi-server"
 UPSTREAM_REPO="${PASSPORT_UPSTREAM_REPO:-https://github.com/xinnan-tech/xiaozhi-esp32-server.git}"
 
 # The demo must never inherit the real signing key or redirect pip elsewhere.
-unset PASSPORT_AUTH_KEY PIP_TARGET PIP_PREFIX PIP_ROOT PIP_USER
-# Never write bytecode into the read-only shared venv / upstream checkout.
+unset PASSPORT_AUTH_KEY PIP_CONFIG_FILE PIP_TARGET PIP_PREFIX PIP_ROOT PIP_USER PIP_PYTHON
+# Never write bytecode into the read-only shared venv / upstream checkout, and
+# never load per-user site-packages outside the demo venv.
 export PYTHONDONTWRITEBYTECODE=1
+export PYTHONNOUSERSITE=1
 
 pick_python() {
   if [ -n "${PASSPORT_PYTHON:-}" ] && [ -x "${PASSPORT_PYTHON}" ]; then
@@ -102,10 +104,17 @@ if [ ! -x "$DEMO_VENV/bin/python" ]; then
 fi
 if [ -x "$SHARED_VENV/bin/python" ]; then
   SHARED_INFO=$("$SHARED_VENV/bin/python" -c 'import sys, sysconfig; print("%d.%d" % sys.version_info[:2]); print(sysconfig.get_paths()["purelib"])')
-  "$DEMO_VENV/bin/python" - "$SHARED_INFO" <<'PY'
+  "$DEMO_VENV/bin/python" - "$SHARED_INFO" "$DEMO_VENV" "$RUNTIME" <<'PY'
 import pathlib, sys, sysconfig
 shared_ver, shared_site = sys.argv[1].splitlines()[:2]
-target = pathlib.Path(sysconfig.get_paths()["purelib"]) / "zz_passport_shared_readonly.pth"
+demo_venv = pathlib.Path(sys.argv[2]).resolve()
+real_runtime = pathlib.Path(sys.argv[3]).resolve()
+purelib = pathlib.Path(sysconfig.get_paths()["purelib"]).resolve()
+if demo_venv not in purelib.parents or purelib == real_runtime or real_runtime in purelib.parents:
+    sys.exit(f"Refusing demo venv purelib outside demo venv: {purelib}")
+target = purelib / "zz_passport_shared_readonly.pth"
+if target.is_symlink():
+    target.unlink()
 if shared_ver == "%d.%d" % sys.version_info[:2]:
     target.write_text(f"import site; site.addsitedir({shared_site!r})\n", encoding="utf-8")
 elif target.exists():
@@ -113,7 +122,57 @@ elif target.exists():
 PY
 fi
 if [ "${PASSPORT_SKIP_PIP:-0}" != "1" ]; then
-  "$DEMO_VENV/bin/python" -m pip install --disable-pip-version-check -r "$ROOT/requirements-runtime.txt"
+  PIP_CONFIG_FILE=/dev/null "$DEMO_VENV/bin/python" - "$DEMO_VENV" "$RUNTIME" \
+    --isolated --disable-pip-version-check -r "$ROOT/requirements-runtime.txt" <<'PY'
+import os, pathlib, sys, sysconfig
+from pip._internal.commands.install import InstallCommand
+from pip._internal.locations import get_scheme
+
+demo_venv = pathlib.Path(sys.argv[1]).resolve()
+real_runtime = pathlib.Path(sys.argv[2]).resolve()
+pip_args = sys.argv[3:]
+
+def _assert_inside_demo(label: str, raw_path: str) -> pathlib.Path:
+    resolved = pathlib.Path(raw_path).resolve()
+    if resolved == real_runtime or real_runtime in resolved.parents:
+        sys.exit(f"Refusing pip {label} inside real runtime: {resolved}")
+    if resolved != demo_venv and demo_venv not in resolved.parents:
+        sys.exit(f"Refusing pip {label} outside demo venv ({demo_venv}): {resolved}")
+    return resolved
+
+if os.environ.get("PIP_CONFIG_FILE") != os.devnull:
+    sys.exit(f"Refusing demo pip without PIP_CONFIG_FILE={os.devnull}")
+
+_assert_inside_demo("sys.prefix", sys.prefix)
+sys_paths = sysconfig.get_paths()
+for key in ("purelib", "platlib", "scripts", "data"):
+    _assert_inside_demo(f"sysconfig.{key}", sys_paths[key])
+
+cmd = InstallCommand("install", "demo-isolation-check")
+options, _ = cmd.parse_args(pip_args)
+if not options.isolated_mode:
+    sys.exit("Refusing demo pip without isolated_mode")
+if options.target_dir or options.prefix_path or options.root_path or getattr(options, "python", None):
+    sys.exit(
+        "Refusing demo pip with redirected install target: "
+        f"target={options.target_dir!r} prefix={options.prefix_path!r} "
+        f"root={options.root_path!r} python={getattr(options, 'python', None)!r}"
+    )
+if options.use_user_site:
+    sys.exit("Refusing demo pip with user site-packages enabled")
+
+scheme = get_scheme(
+    "passport-demo-isolation-check",
+    user=bool(options.use_user_site),
+    root=options.root_path,
+    isolated=bool(options.isolated_mode),
+    prefix=options.prefix_path,
+)
+for attr in ("purelib", "platlib", "headers", "scripts", "data"):
+    _assert_inside_demo(f"scheme.{attr}", getattr(scheme, attr))
+PY
+  PIP_CONFIG_FILE=/dev/null "$DEMO_VENV/bin/python" -m pip install \
+    --isolated --disable-pip-version-check -r "$ROOT/requirements-runtime.txt"
 fi
 PYV="$DEMO_VENV/bin/python"
 

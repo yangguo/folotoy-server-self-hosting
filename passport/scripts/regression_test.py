@@ -7,6 +7,8 @@ never logs or prints raw experimental tokens/secrets.
 """
 
 import asyncio
+import base64
+import hashlib
 import json
 import logging
 import os
@@ -24,10 +26,11 @@ import threading
 import time
 import urllib.error
 import urllib.request
+import zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Optional
-from urllib.parse import urlsplit
+from urllib.parse import unquote, urlsplit
 
 import websockets
 import yaml
@@ -1445,6 +1448,235 @@ def test_demo_isolation_preserves_real_state(server_home: Path) -> None:
     print("[PASS] blocker #1: demo script and Compose override strictly isolated; real runtime files byte-identical")
 
 
+def _build_local_test_wheel(dest_dir: Path, pkg_name: str, version: str, marker: str) -> Path:
+    """Create a minimal dependency-free pure-Python wheel on disk for offline pip install tests."""
+    dist_info = f"{pkg_name}-{version}.dist-info"
+    files = {
+        f"{pkg_name}/__init__.py": f"MARKER = {marker!r}\n".encode("utf-8"),
+        f"{dist_info}/METADATA": (
+            f"Metadata-Version: 2.1\nName: {pkg_name.replace('_', '-')}\nVersion: {version}\n"
+        ).encode("utf-8"),
+        f"{dist_info}/WHEEL": (
+            "Wheel-Version: 1.0\nGenerator: passport-regression-test\nRoot-Is-Purelib: true\nTag: py3-none-any\n"
+        ).encode("utf-8"),
+        f"{dist_info}/top_level.txt": f"{pkg_name}\n".encode("utf-8"),
+    }
+    records = []
+    for rel_path, content in files.items():
+        digest = base64.urlsafe_b64encode(hashlib.sha256(content).digest()).rstrip(b"=").decode("ascii")
+        records.append(f"{rel_path},sha256={digest},{len(content)}")
+    records.append(f"{dist_info}/RECORD,,")
+    files[f"{dist_info}/RECORD"] = ("\n".join(records) + "\n").encode("utf-8")
+
+    wheel_path = dest_dir / f"{pkg_name}-{version}-py3-none-any.whl"
+    with zipfile.ZipFile(wheel_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        for rel_path, content in files.items():
+            zf.writestr(rel_path, content)
+    return wheel_path
+
+
+def test_demo_pip_controlled_install_isolation(server_home: Path) -> None:
+    """Round-3 blocker #2: hostile user/site/PIP_CONFIG_FILE install.target cannot divert demo pip into shared venv."""
+    real_files = [
+        ROOT / "runtime" / "devices.yaml",
+        ROOT / "runtime" / "auth_key",
+        server_home / "data" / ".config.yaml",
+        ROOT / "config" / "server.config.yaml",
+    ]
+    real_before = _snapshot_files(real_files)
+    real_venv_before = _tree_signature(ROOT / "runtime" / "venv")
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp = Path(tmpdir)
+        probe_marker = "demo_probe_" + secrets.token_hex(8)
+        wheel_path = _build_local_test_wheel(tmp, "passport_demo_probe", "0.1.0", probe_marker)
+
+        # Negative control: unhardened pip honors PIP_CONFIG_FILE install.target and diverts writes out of venv.
+        ctrl_venv = tmp / "ctrl_venv"
+        ctrl_target = tmp / "ctrl_target"
+        ctrl_target.mkdir(parents=True)
+        subprocess.run([sys.executable, "-m", "venv", str(ctrl_venv)], check=True, capture_output=True)
+        ctrl_pip_conf = tmp / "ctrl_pip.conf"
+        ctrl_pip_conf.write_text(f"[install]\ntarget = {ctrl_target}\n", encoding="utf-8")
+        ctrl_res = subprocess.run(
+            [str(ctrl_venv / "bin" / "python"), "-m", "pip", "install", "--no-deps", "--no-index", str(wheel_path)],
+            env=_base_env(PIP_CONFIG_FILE=str(ctrl_pip_conf)),
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        assert ctrl_res.returncode == 0, f"negative-control pip install failed: {ctrl_res.stderr}"
+        assert (ctrl_target / "passport_demo_probe" / "__init__.py").is_file(), (
+            "negative control failed: pip did not honor install.target in PIP_CONFIG_FILE"
+        )
+
+        # Build isolated passport copy with a writable simulated shared runtime/venv.
+        passport_copy = tmp / "passport_copy"
+        passport_copy.mkdir(parents=True)
+        ignore = shutil.ignore_patterns("__pycache__", "*.pyc", "*.pyo")
+        for subdir in ("config", "passport_server", "scripts"):
+            shutil.copytree(ROOT / subdir, passport_copy / subdir, ignore=ignore)
+        shutil.copy2(ROOT / "fake_provider.py", passport_copy / "fake_provider.py")
+        req_text = (ROOT / "requirements-runtime.txt").read_text(encoding="utf-8").rstrip()
+        (passport_copy / "requirements-runtime.txt").write_text(
+            req_text + f"\n{wheel_path}\n", encoding="utf-8"
+        )
+
+        copy_runtime = passport_copy / "runtime"
+        copy_runtime.mkdir(parents=True)
+        (copy_runtime / "xiaozhi-esp32-server").symlink_to(ROOT / "runtime" / "xiaozhi-esp32-server")
+
+        sim_shared_venv = copy_runtime / "venv"
+        subprocess.run(
+            [sys.executable, "-m", "venv", "--without-pip", str(sim_shared_venv)],
+            check=True,
+            capture_output=True,
+        )
+        sim_shared_site = Path(
+            subprocess.check_output(
+                [str(sim_shared_venv / "bin" / "python"), "-c", 'import sysconfig; print(sysconfig.get_paths()["purelib"])'],
+                text=True,
+            ).strip()
+        )
+        real_shared_site = Path(
+            subprocess.check_output(
+                [str(ROOT / "runtime" / "venv" / "bin" / "python"), "-c", 'import sysconfig; print(sysconfig.get_paths()["purelib"])'],
+                text=True,
+            ).strip()
+        )
+        (sim_shared_site / "zz_real_readonly.pth").write_text(
+            f"import site; site.addsitedir({str(real_shared_site)!r})\n", encoding="utf-8"
+        )
+        sim_shared_before = _tree_signature(sim_shared_venv)
+
+        # Pre-create demo venv and plant hostile site, user, XDG, and PIP_CONFIG_FILE configs
+        # that all try to redirect `[install] target` into sim_shared_site.
+        demo_root = passport_copy / "runtime-demo"
+        demo_venv = demo_root / "venv"
+        subprocess.run(
+            [str(sim_shared_venv / "bin" / "python"), "-m", "venv", str(demo_venv)],
+            check=True,
+            capture_output=True,
+        )
+        hostile_cfg_body = f"[install]\ntarget = {sim_shared_site}\n"
+        (demo_venv / "pip.conf").write_text(hostile_cfg_body, encoding="utf-8")
+
+        fake_home = tmp / "fake_home"
+        fake_xdg = tmp / "fake_xdg"
+        for cfg_path in (
+            fake_home / ".config" / "pip" / "pip.conf",
+            fake_home / ".pip" / "pip.conf",
+            fake_xdg / "pip" / "pip.conf",
+            tmp / "hostile_pip.conf",
+        ):
+            cfg_path.parent.mkdir(parents=True, exist_ok=True)
+            cfg_path.write_text(hostile_cfg_body, encoding="utf-8")
+
+        demo_res = subprocess.run(
+            ["sh", str(passport_copy / "scripts" / "run_isolated.sh")],
+            env=_base_env(
+                PASSPORT_SKIP_PIP="0",
+                PASSPORT_SKIP_REGRESSION="1",
+                PASSPORT_PYTHON=sys.executable,
+                HOME=str(fake_home),
+                XDG_CONFIG_HOME=str(fake_xdg),
+                PIP_CONFIG_FILE=str(tmp / "hostile_pip.conf"),
+                PIP_TARGET=str(sim_shared_site),
+                PIP_PREFIX=str(sim_shared_venv),
+                PIP_ROOT=str(sim_shared_venv),
+                PIP_USER="1",
+                PIP_PYTHON=str(sim_shared_venv / "bin" / "python"),
+                PASSPORT_WS_BIND_PORT=str(_free_port()),
+                PASSPORT_HTTP_BIND_PORT=str(_free_port()),
+                PASSPORT_FAKE_PORT=str(_free_port()),
+            ),
+            capture_output=True,
+            text=True,
+            timeout=180,
+        )
+        assert demo_res.returncode == 0, (
+            f"controlled pip run_isolated.sh failed ({demo_res.returncode}):\n"
+            f"{redact_text(demo_res.stdout)}\n{redact_text(demo_res.stderr)}"
+        )
+        assert "PASSED tightened upstream websocket contract with local fake providers" in demo_res.stdout
+
+        # Verify actual write landed inside demo_venv and never touched sim_shared_venv or real runtime/venv.
+        demo_site = Path(
+            subprocess.check_output(
+                [str(demo_venv / "bin" / "python"), "-c", 'import sysconfig; print(sysconfig.get_paths()["purelib"])'],
+                text=True,
+            ).strip()
+        ).resolve()
+        assert demo_venv.resolve() in demo_site.parents
+        installed_init = demo_site / "passport_demo_probe" / "__init__.py"
+        installed_meta = demo_site / "passport_demo_probe-0.1.0.dist-info" / "METADATA"
+        assert installed_init.is_file() and installed_meta.is_file(), (
+            f"expected demo probe package inside {demo_site}"
+        )
+        assert probe_marker in installed_init.read_text(encoding="utf-8")
+        probe_check = subprocess.run(
+            [
+                str(demo_venv / "bin" / "python"),
+                "-c",
+                (
+                    "import pathlib, passport_demo_probe; "
+                    f"p = pathlib.Path(passport_demo_probe.__file__).resolve(); "
+                    f"assert pathlib.Path({str(demo_venv.resolve())!r}) in p.parents, p; "
+                    f"assert passport_demo_probe.MARKER == {probe_marker!r}"
+                ),
+            ],
+            capture_output=True,
+            text=True,
+        )
+        assert probe_check.returncode == 0, f"demo package import check failed: {probe_check.stderr}"
+
+        assert not (sim_shared_site / "passport_demo_probe").exists(), (
+            "demo pip wrote package into simulated shared runtime/venv"
+        )
+        assert _tree_signature(sim_shared_venv) == sim_shared_before, (
+            "demo pip install modified simulated shared runtime/venv"
+        )
+        assert _tree_signature(ROOT / "runtime" / "venv") == real_venv_before, (
+            "demo pip install modified real passport/runtime/venv"
+        )
+
+        # Guardrail: symlinked purelib inside demo_venv pointing to sim_shared_site must be rejected before writes.
+        escaped_demo = passport_copy / "runtime-demo-escaped"
+        escaped_venv = escaped_demo / "venv"
+        subprocess.run(
+            [str(sim_shared_venv / "bin" / "python"), "-m", "venv", "--without-pip", str(escaped_venv)],
+            check=True,
+            capture_output=True,
+        )
+        escaped_site = Path(
+            subprocess.check_output(
+                [str(escaped_venv / "bin" / "python"), "-c", 'import sysconfig; print(sysconfig.get_paths()["purelib"])'],
+                text=True,
+            ).strip()
+        )
+        shutil.rmtree(escaped_site)
+        escaped_site.symlink_to(sim_shared_site)
+        esc_res = subprocess.run(
+            ["sh", str(passport_copy / "scripts" / "run_isolated.sh")],
+            env=_base_env(
+                PASSPORT_DEMO_RUNTIME=str(escaped_demo),
+                PASSPORT_SKIP_PIP="0",
+                PASSPORT_SKIP_REGRESSION="1",
+                PASSPORT_PYTHON=sys.executable,
+            ),
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        assert esc_res.returncode != 0, "run_isolated.sh must refuse demo venv whose purelib symlinks outside demo_venv"
+        assert _tree_signature(sim_shared_venv) == sim_shared_before, (
+            "escaped purelib guardrail modified simulated shared runtime/venv before refusing"
+        )
+
+        _assert_files_unchanged(real_before, "post-controlled-pip real passport/runtime/")
+    print("[PASS] round-3 blocker #2: controlled demo pip wrote test package into demo venv only; shared venv untouched")
+
+
 def test_reverse_proxy_templates_and_forwarding(ota_base: str, dev_a: dict) -> None:
     """Blocker #2: validate Nginx/Caddy proxy templates and verify log-free OTA secret forwarding."""
     readme_text = (ROOT / "README.zh_CN.md").read_text(encoding="utf-8")
@@ -1465,10 +1697,11 @@ def test_reverse_proxy_templates_and_forwarding(ota_base: str, dev_a: dict) -> N
         "Nginx does not support `error_log off;`; use `/dev/null emerg;`"
     )
 
-    # Verify log_format passport_safe never emits unsafe raw request/header variables.
+    # Verify log_format passport_safe never emits unsafe raw request/header variables or Referer.
     log_fmt_match = re.search(r"log_format\s+passport_safe\s+(.*?);", nginx_text, re.DOTALL)
     assert log_fmt_match, "Missing log_format passport_safe in nginx template"
-    fmt_vars = set(re.findall(r"\$[A-Za-z0-9_]+", log_fmt_match.group(1)))
+    fmt_body = log_fmt_match.group(1)
+    fmt_vars = set(re.findall(r"\$[A-Za-z0-9_]+", fmt_body))
     forbidden_nginx_vars = {
         "$request",
         "$request_uri",
@@ -1478,66 +1711,52 @@ def test_reverse_proxy_templates_and_forwarding(ota_base: str, dev_a: dict) -> N
         "$http_x_ota_secret",
         "$http_cookie",
         "$http_referer",
+        "$passport_safe_referer",
     }
     assert not (fmt_vars & forbidden_nginx_vars), f"Unsafe nginx log_format vars: {fmt_vars & forbidden_nginx_vars}"
+    assert not any("referer" in v.lower() for v in fmt_vars), f"Referer var still in log_format: {fmt_vars}"
+    assert '"-"' in fmt_body, "log_format passport_safe must emit literal \"-\" for Referer"
+    assert not re.search(r"map\s+\$http_referer\s+\$passport_safe_referer\b", nginx_text), (
+        "Obsolete $passport_safe_referer map should be removed when access log omits Referer"
+    )
     assert "access_log /var/log/nginx/passport_access.log passport_safe;" in nginx_text
 
-    # Parse actual `map` regexes from nginx template and evaluate against synthetic secrets.
-    def _parse_nginx_map(var_name: str) -> list[tuple[Optional[re.Pattern], str]]:
-        m = re.search(
-            rf"map\s+\$\w+\s+\${re.escape(var_name)}\s*\{{(.*?)\}}",
-            nginx_text,
-            re.DOTALL,
-        )
-        assert m, f"Missing map ${var_name} in nginx template"
-        rules = []
-        for raw_line in m.group(1).splitlines():
-            line = raw_line.strip()
-            if not line or line.startswith("#"):
-                continue
-            assert line.endswith(";"), f"Malformed map rule: {line}"
-            line = line[:-1].strip()
-            parts = line.split(None, 1)
-            assert len(parts) == 2, f"Malformed map rule: {line}"
-            pat_raw, out_raw = parts[0], parts[1].strip().strip('"')
-            if pat_raw == "default":
-                rules.append((None, out_raw))
-            elif pat_raw.startswith("~(?i)"):
-                rules.append((re.compile(pat_raw[5:], re.IGNORECASE), out_raw))
-            elif pat_raw.startswith("~"):
-                rules.append((re.compile(pat_raw[1:]), out_raw))
-            else:
-                rules.append((re.compile(f"^{re.escape(pat_raw.strip('\"'))}$"), out_raw))
-        return rules
-
-    def _eval_map(rules: list[tuple[Optional[re.Pattern], str]], value: str) -> str:
-        for pat, out in rules:
-            if pat is None:
-                return value if out.startswith("$") else out
-            if pat.search(value):
-                return value if out.startswith("$") else out
-        return ""
-
-    uri_rules = _parse_nginx_map("passport_safe_uri")
-    query_rules = _parse_nginx_map("passport_safe_query")
-    ref_rules = _parse_nginx_map("passport_safe_referer")
+    _, uri_rules = _nginx_map_rules(nginx_text, "passport_safe_uri")
+    _, query_rules = _nginx_map_rules(nginx_text, "passport_safe_query")
+    ref_src, unsafe_ref_rules = _nginx_map_rules(nginx_text, "passport_unsafe_referer")
+    assert ref_src == "http_referer"
 
     syn_secret = "proxy_ota_" + secrets.token_hex(12)
     syn_qtok = "proxy_qtok_" + secrets.token_hex(10)
     syn_user = "proxy_usr_" + secrets.token_hex(5)
     syn_pass = "proxy_pwd_" + secrets.token_hex(6)
 
-    for test_uri, test_is_args, test_ref in (
-        (f"/xiaozhi/ota/d/{syn_secret}/", "", f"https://host/xiaozhi/ota/d/{syn_secret}/"),
-        (f"//xiaozhi/ota/d/{syn_secret}/", "?", f"https://{syn_user}:{syn_pass}@host/path"),
-        (f"/xiaozhi/ota/d/{syn_secret}/extra", "?", f"https://host/?token={syn_qtok}"),
-        ("/xiaozhi/v1/", "?", f"https://host/xiaozhi/ota/d/{syn_secret}/"),
+    for test_uri, test_is_args in (
+        (f"/xiaozhi/ota/d/{syn_secret}/", ""),
+        (f"//xiaozhi/ota/d/{syn_secret}/", "?"),
+        (f"/xiaozhi//ota///d/{syn_secret}/", "?"),
+        (f"/xiaozhi/ota/d/{syn_secret}/extra", "?"),
+        ("/xiaozhi/v1/", "?"),
     ):
-        rendered_uri = _eval_map(uri_rules, test_uri) + _eval_map(query_rules, test_is_args)
-        rendered_ref = _eval_map(ref_rules, test_ref)
-        combined_line = f"{rendered_uri} {rendered_ref}"
+        rendered_uri = _eval_nginx_map(uri_rules, test_uri) + _eval_nginx_map(query_rules, test_is_args)
         for forbidden in (syn_secret, syn_qtok, syn_user, syn_pass):
-            assert forbidden not in combined_line, f"Nginx map leaked secret: {combined_line}"
+            assert forbidden not in rendered_uri, f"Nginx URI map leaked secret: {rendered_uri}"
+
+    # Verify $passport_unsafe_referer strict allowlist allows empty/bare-origin and rejects
+    # literal, slash-encoded, letter-percent-encoded, dot-segment, userinfo, query, and non-root paths.
+    for safe_ref in ("", "https://proxy.example", "https://proxy.example/", "http://127.0.0.1:8443/", "https://[::1]:8443/"):
+        assert _eval_nginx_map(unsafe_ref_rules, safe_ref) == "0", f"Safe Referer rejected: {safe_ref!r}"
+    for bad_ref in (
+        f"https://proxy.example/xiaozhi/ota/d/{syn_secret}/",
+        f"https://proxy.example/xiaozhi%2Fota%2Fd%2F{syn_secret}%2F",
+        f"https://proxy.example/%78iaozhi/%6fta/%64/{syn_secret}/",
+        f"https://proxy.example/%78%69%61%6f%7a%68%69/%6f%74%61/%64/{syn_secret}/",
+        f"https://proxy.example/xiaozhi/./foo/../ota//d/{syn_secret}/",
+        f"https://{syn_user}:{syn_pass}@proxy.example/",
+        f"https://proxy.example/?token={syn_qtok}",
+        "https://proxy.example/docs",
+    ):
+        assert _eval_nginx_map(unsafe_ref_rules, bad_ref) == "1", f"Unsafe Referer bypassed allowlist: {bad_ref!r}"
 
     # Verify /xiaozhi/ota/d/ location block order & directives.
     ota_prefix_match = re.search(r"location\s+\^~\s+/xiaozhi/ota/d/\s*\{(.*?)\n    \}", nginx_text, re.DOTALL)
@@ -1622,18 +1841,30 @@ def test_reverse_proxy_templates_and_forwarding(ota_base: str, dev_a: dict) -> N
             # Redirect all server-level messages under proxy control so raw URLs never leak.
             pass
 
-        def _safe_log_line(self, method: str, path: str, query: str, status: int, length: int, referer: str) -> str:
-            safe_uri = _eval_map(uri_rules, path) + _eval_map(query_rules, "?" if query else "")
-            safe_ref = _eval_map(ref_rules, referer)
-            return f'{self.address_string()} - "{method} {safe_uri} HTTP/1.1" {status} {length} "{safe_ref}"'
+        def _safe_log_line(self, method: str, norm_path: str, query: str, status: int, length: int) -> str:
+            safe_uri = _eval_nginx_map(uri_rules, norm_path) + _eval_nginx_map(query_rules, "?" if query else "")
+            return f'{self.address_string()} - "{method} {safe_uri} HTTP/1.1" {status} {length} "-"'
 
         def _handle(self, method: str) -> None:
             parsed = urlsplit(self.path)
-            path, query = parsed.path, parsed.query
+            norm_path = _nginx_normalize_uri(parsed.path)
+            query = parsed.query
             length = int(self.headers.get("Content-Length", "0"))
             raw_body = self.rfile.read(length) if length > 0 else b""
             referer = self.headers.get("Referer", "")
-            is_secret_prefix = path.startswith("/xiaozhi/ota/d/")
+            is_secret_prefix = norm_path.startswith("/xiaozhi/ota/d/")
+
+            # Server-level guard (`if ($passport_unsafe_referer) { return 400; }`) runs before location matching.
+            if _eval_nginx_map(unsafe_ref_rules, referer) not in ("", "0"):
+                resp_body = b'{"success":false,"message":"unsafe referer"}'
+                with proxy_lock:
+                    proxy_access_logs.append(self._safe_log_line(method, norm_path, query, 400, len(resp_body)))
+                self.send_response(400)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(resp_body)))
+                self.end_headers()
+                self.wfile.write(resp_body)
+                return
 
             if query and PROXY_SENSITIVE_QUERY_RE.search(query):
                 resp_body = b'{"success":false,"message":"query credentials forbidden"}'
@@ -1641,7 +1872,7 @@ def test_reverse_proxy_templates_and_forwarding(ota_base: str, dev_a: dict) -> N
                 if not is_secret_prefix:
                     with proxy_lock:
                         proxy_access_logs.append(
-                            self._safe_log_line(method, path, query, 400, len(resp_body), referer)
+                            self._safe_log_line(method, norm_path, query, 400, len(resp_body))
                         )
                 self.send_response(400)
                 self.send_header("Content-Type", "application/json")
@@ -1668,8 +1899,8 @@ def test_reverse_proxy_templates_and_forwarding(ota_base: str, dev_a: dict) -> N
                     continue
                 forward_headers[hk] = hv
 
-            target_path = path
-            secret_match = ota_secret_route_re.match(path)
+            target_path = norm_path
+            secret_match = ota_secret_route_re.match(norm_path)
             if is_secret_prefix and not secret_match:
                 resp_body = b"404 Not Found"
                 self.send_response(404)
@@ -1705,7 +1936,7 @@ def test_reverse_proxy_templates_and_forwarding(ota_base: str, dev_a: dict) -> N
             if not is_secret_prefix:
                 with proxy_lock:
                     proxy_access_logs.append(
-                        self._safe_log_line(method, path, query, status, len(resp_body), referer)
+                        self._safe_log_line(method, norm_path, query, status, len(resp_body))
                     )
             self.send_response(status)
             self.send_header("Content-Type", ctype)
@@ -1729,19 +1960,51 @@ def test_reverse_proxy_templates_and_forwarding(ota_base: str, dev_a: dict) -> N
         wrong_secret = "wrong_proxy_" + secrets.token_hex(8)
         q_sentinel = "q_proxy_" + secrets.token_hex(8)
 
-        # 1. Valid OTA secret path forwarded with decoy tracing headers -> 200 + WS token.
+        # 1a. Valid OTA secret path (literal) with bare-origin Referer & decoy tracing headers -> 200 + WS token.
         st_ok, body_ok = post_ota(
             proxy_base,
             {
                 "Device-Id": dev_a["device_id"],
                 "Client-Id": dev_a["client_id"],
                 "X-Original-URI": f"/xiaozhi/ota/d/{dev_a['ota_secret']}/",
-                "Referer": f"https://proxy.example/xiaozhi/ota/d/{dev_a['ota_secret']}/",
+                "Referer": "https://proxy.example/",
             },
             secret=dev_a["ota_secret"],
         )
         assert st_ok == 200 and body_ok["websocket"]["token"], f"Proxy OTA forward failed: {st_ok} {body_ok}"
         issued_ws_token = body_ok["websocket"]["token"]
+
+        # 1b. Equivalent fixed-segment letter-percent-encoded OTA path normalizes identically -> 200 + WS token.
+        letter_encoded_ota_path = f"/%78iaozhi/%6fta/%64/{dev_a['ota_secret']}/"
+        assert _nginx_normalize_uri(letter_encoded_ota_path) == f"/xiaozhi/ota/d/{dev_a['ota_secret']}/"
+        st_enc, body_enc = post_json(
+            f"{proxy_base}{letter_encoded_ota_path}",
+            {
+                "Device-Id": dev_a["device_id"],
+                "Client-Id": dev_a["client_id"],
+                "Referer": "https://proxy.example/",
+            },
+        )
+        assert st_enc == 200 and body_enc["websocket"]["token"], (
+            f"Letter-encoded OTA proxy forward failed: {st_enc} {body_enc}"
+        )
+        issued_ws_token_enc = body_enc["websocket"]["token"]
+
+        # 1c. Secret-bearing literal & letter-percent-encoded Referers rejected with 400.
+        for bad_ref in (
+            f"https://proxy.example/xiaozhi/ota/d/{dev_a['ota_secret']}/",
+            f"https://proxy.example/%78iaozhi/%6fta/%64/{dev_a['ota_secret']}/",
+        ):
+            for req_path in ("/xiaozhi/ota/", f"/xiaozhi/ota/d/{dev_a['ota_secret']}/"):
+                st_ref, _ = post_json(
+                    f"{proxy_base}{req_path}",
+                    {
+                        "Device-Id": dev_a["device_id"],
+                        "Client-Id": dev_a["client_id"],
+                        "Referer": bad_ref,
+                    },
+                )
+                assert st_ref == 400, f"Unsafe Referer {bad_ref} on {req_path} returned {st_ref}"
 
         # 2. Query credential rejected with 400.
         st_q, _ = post_json(
@@ -1770,7 +2033,8 @@ def test_reverse_proxy_templates_and_forwarding(ota_base: str, dev_a: dict) -> N
         joined_proxy_logs = "\n".join(proxy_access_logs + proxy_error_logs)
         assert "/xiaozhi/ota/" in joined_proxy_logs
         assert "/xiaozhi/ota/?[REDACTED]" in joined_proxy_logs
-        for forbidden in (dev_a["ota_secret"], wrong_secret, q_sentinel, issued_ws_token):
+        assert "/xiaozhi/ota/d/[REDACTED]/" in joined_proxy_logs
+        for forbidden in (dev_a["ota_secret"], wrong_secret, q_sentinel, issued_ws_token, issued_ws_token_enc):
             assert forbidden not in joined_proxy_logs, "Proxy log leaked credential!"
     finally:
         proxy_srv.shutdown()
@@ -1869,38 +2133,74 @@ def _nginx_server_guards(nginx_text: str) -> list[tuple[str, int]]:
     ]
 
 
+def _nginx_normalize_uri(raw_path: str) -> str:
+    """Model Nginx URI normalization: percent-decode, resolve dot-segments, merge slashes."""
+    decoded = unquote(raw_path)
+    if not decoded.startswith("/"):
+        decoded = "/" + decoded
+    trailing_slash = decoded.endswith("/") or decoded.endswith("/.") or decoded.endswith("/..")
+    parts: list[str] = []
+    for seg in decoded.split("/"):
+        if not seg or seg == ".":
+            continue
+        if seg == "..":
+            if parts:
+                parts.pop()
+        else:
+            parts.append(seg)
+    normalized = "/" + "/".join(parts)
+    if trailing_slash and normalized != "/":
+        normalized += "/"
+    return normalized
+
+
+def _eval_nginx_map(rules: list[tuple[Optional[re.Pattern], str]], value: str) -> str:
+    """Evaluate parsed Nginx `map` rules in exact-then-regex-then-default order."""
+    for pat, out in rules:
+        if pat is None:
+            return value if out.startswith("$") else out
+        if pat.search(value):
+            return value if out.startswith("$") else out
+    return ""
+
+
 def _nginx_map_rules(nginx_text: str, var_name: str) -> tuple[str, list[tuple[Optional[re.Pattern], str]]]:
     m = re.search(rf"map\s+\$(\w+)\s+\${re.escape(var_name)}\s*\{{(.*?)\}}", nginx_text, re.DOTALL)
     assert m, f"Missing map ${var_name}"
-    rules: list[tuple[Optional[re.Pattern], str]] = []
+    exact_rules: list[tuple[Optional[re.Pattern], str]] = []
+    regex_rules: list[tuple[Optional[re.Pattern], str]] = []
+    default_rules: list[tuple[Optional[re.Pattern], str]] = []
     for raw_line in m.group(2).splitlines():
         line = raw_line.strip()
         if not line or line.startswith("#"):
             continue
-        pat_raw, out_raw = line.rstrip(";").split(None, 1)
+        assert line.endswith(";"), f"Malformed map rule: {line}"
+        pat_raw, out_raw = line[:-1].strip().split(None, 1)
         out_raw = out_raw.strip().strip('"')
         if pat_raw == "default":
-            rules.append((None, out_raw))
+            default_rules.append((None, out_raw))
         elif pat_raw.startswith("~(?i)"):
-            rules.append((re.compile(pat_raw[5:], re.IGNORECASE), out_raw))
+            regex_rules.append((re.compile(pat_raw[5:], re.IGNORECASE), out_raw))
         elif pat_raw.startswith("~*"):
-            rules.append((re.compile(pat_raw[2:], re.IGNORECASE), out_raw))
+            regex_rules.append((re.compile(pat_raw[2:], re.IGNORECASE), out_raw))
         elif pat_raw.startswith("~"):
-            rules.append((re.compile(pat_raw[1:]), out_raw))
+            regex_rules.append((re.compile(pat_raw[1:]), out_raw))
         else:
-            rules.append((re.compile("^" + re.escape(pat_raw.strip('"')) + "$"), out_raw))
-    return m.group(1), rules
+            exact_rules.append((re.compile("^" + re.escape(pat_raw.strip('"')) + "$"), out_raw))
+    return m.group(1), exact_rules + regex_rules + default_rules
 
 
 def test_proxy_runtime_error_logs_redacted() -> None:
-    """Round-2 blockers 1 & 2: backend-failure (502) runtime/error logs never record OTA secrets.
+    """Round-2/3 proxy log redaction: backend-failure (502) error & access logs never record OTA secrets.
 
-    No nginx/caddy binaries are available, so in-process HTTP stand-ins are driven
-    by the parsed templates: Caddy's global log include/exclude + filter fields and
-    nginx's server-level guards. On a dead upstream they emit error entries exactly
-    as the real servers do (Caddy: original pre-rewrite request + headers; nginx:
-    raw request line + raw `referrer:`). Negative controls prove the stand-ins
-    detect the leak when the template protection is removed.
+    No nginx/caddy binaries are installed in this offline sandbox, so in-process HTTP
+    stand-ins are driven directly by the parsed templates (explicitly not a substitute
+    for real Nginx binary acceptance). On a dead upstream they emit error and access
+    entries matching the real servers' semantics (Caddy: original pre-rewrite request
+    + headers; nginx: normalized `$uri` for routing/`$uri` maps, raw request line +
+    raw `referrer:` in error_log, and template-parsed `log_format passport_safe` in
+    access_log). Negative controls prove both the Round-3 letter-percent-encoding
+    bypass and guard-removal leak detection.
     """
     caddy_text = (ROOT / "proxy" / "Caddyfile.example").read_text(encoding="utf-8")
     nginx_text = (ROOT / "proxy" / "nginx-passport.conf.example").read_text(encoding="utf-8")
@@ -1921,23 +2221,38 @@ def test_proxy_runtime_error_logs_redacted() -> None:
     def _make_handler(flavor: str, template: str, sinks):
         guards = _nginx_server_guards(template) if flavor == "nginx" else []
         site_err_m = re.search(r"^    error_log\s+(\S+)\s+(\w+);", template, re.MULTILINE) if flavor == "nginx" else None
+        site_acc_m = re.search(r"^    access_log\s+(\S+)\s+(\w+);", template, re.MULTILINE) if flavor == "nginx" else None
         ota_d_block_m = re.search(r"location\s+\^~\s+/xiaozhi/ota/d/\s*\{(.*?)\n    \}", template, re.DOTALL)
+        fmt_vars: set[str] = set()
+        if flavor == "nginx":
+            log_fmt_m = re.search(r"log_format\s+passport_safe\s+(.*?);", template, re.DOTALL)
+            assert log_fmt_m, "Missing log_format passport_safe in nginx template"
+            fmt_vars = set(re.findall(r"\$[A-Za-z0-9_]+", log_fmt_m.group(1)))
 
-        def _guard_hit(cond: str, path: str, query: str, headers) -> bool:
+        def _guard_hit(cond: str, norm_path: str, query: str, headers) -> bool:
             var_m = re.fullmatch(r"\$(\w+)", cond)
             if var_m:
                 src, rules = _nginx_map_rules(template, var_m.group(1))
-                src_val = {"http_referer": headers.get("Referer", ""), "args": query, "uri": path}[src]
-                out = ""
-                for pat, val in rules:
-                    if pat is None or pat.search(src_val):
-                        out = src_val if val.startswith("$") else val
-                        break
-                return out not in ("", "0")
+                src_val = {"http_referer": headers.get("Referer", ""), "args": query, "uri": norm_path}[src]
+                return _eval_nginx_map(rules, src_val) not in ("", "0")
             args_m = re.fullmatch(r'\$args\s+~\*\s+"(.*)"', cond)
             if args_m:
                 return bool(re.search(args_m.group(1), query, re.IGNORECASE))
             raise AssertionError(f"Unsupported nginx server guard: {cond}")
+
+        def _render_nginx_access_line(method: str, norm_path: str, query: str, status: int, headers) -> str:
+            _, uri_r = _nginx_map_rules(template, "passport_safe_uri")
+            _, qry_r = _nginx_map_rules(template, "passport_safe_query")
+            safe_uri = _eval_nginx_map(uri_r, norm_path) + _eval_nginx_map(qry_r, "?" if query else "")
+            raw_ref = headers.get("Referer", "")
+            if "$passport_safe_referer" in fmt_vars:
+                _, ref_r = _nginx_map_rules(template, "passport_safe_referer")
+                ref_field = _eval_nginx_map(ref_r, raw_ref)
+            elif "$http_referer" in fmt_vars:
+                ref_field = raw_ref
+            else:
+                ref_field = "-"
+            return f'127.0.0.1 - "{method} {safe_uri} HTTP/1.1" {status} 2 "{ref_field}"'
 
         class _Handler(BaseHTTPRequestHandler):
             protocol_version = "HTTP/1.1"
@@ -1957,14 +2272,20 @@ def test_proxy_runtime_error_logs_redacted() -> None:
                 if length:
                     self.rfile.read(length)
                 parsed = urlsplit(self.path)
-                path, query = parsed.path, parsed.query
+                norm_path = _nginx_normalize_uri(parsed.path)
+                query = parsed.query
                 if flavor == "nginx":
                     for cond, code in guards:
-                        if _guard_hit(cond, path, query, self.headers):
+                        if _guard_hit(cond, norm_path, query, self.headers):
+                            if site_acc_m:
+                                sinks["access"].append(
+                                    _render_nginx_access_line(self.command, norm_path, query, code, self.headers)
+                                )
                             self._reply(code)  # `return` writes nothing to error_log
                             return
-                    in_secret_loc = path.startswith("/xiaozhi/ota/d/")
+                    in_secret_loc = norm_path.startswith("/xiaozhi/ota/d/")
                     err_sink_null = in_secret_loc and ota_d_block_m and "error_log /dev/null emerg;" in ota_d_block_m.group(1)
+                    acc_off = in_secret_loc and ota_d_block_m and "access_log off;" in ota_d_block_m.group(1)
                     if not _upstream_fails():
                         raise AssertionError("dead upstream port unexpectedly accepted")
                     if not err_sink_null and site_err_m:
@@ -1975,7 +2296,11 @@ def test_proxy_runtime_error_logs_redacted() -> None:
                         )
                         if self.headers.get("Referer"):
                             line += f', referrer: "{self.headers["Referer"]}"'
-                        sinks.append(line)
+                        sinks["err"].append(line)
+                    if not acc_off and site_acc_m:
+                        sinks["access"].append(
+                            _render_nginx_access_line(self.command, norm_path, query, 502, self.headers)
+                        )
                     self._reply(502)
                     return
                 # Caddy: original request is captured before `rewrite` for error logs.
@@ -1986,7 +2311,7 @@ def test_proxy_runtime_error_logs_redacted() -> None:
                     "uri": self.path,
                     "headers": {k: [v] for k, v in self.headers.items()},
                 }
-                if caddy_secret_re.match(path):
+                if caddy_secret_re.match(norm_path):
                     pass  # rewrite * /xiaozhi/ota/ happens on a copy; logs keep original
                 if not _upstream_fails():
                     raise AssertionError("dead upstream port unexpectedly accepted")
@@ -2024,7 +2349,7 @@ def test_proxy_runtime_error_logs_redacted() -> None:
             base = f"http://127.0.0.1:{srv.server_address[1]}"
             for method, path, referer in requests_spec:
                 headers = {"Content-Type": "application/json", "Device-Id": "aa:bb:cc:dd:ee:99"}
-                if referer:
+                if referer is not None:
                     headers["Referer"] = referer
                 req = urllib.request.Request(
                     base + path, data=b"{}" if method == "POST" else None, headers=headers, method=method
@@ -2041,7 +2366,25 @@ def test_proxy_runtime_error_logs_redacted() -> None:
         return statuses
 
     secret_ref = f"https://passport.example/xiaozhi/ota/d/{syn}/"
-    encoded_ref = f"https://passport.example/xiaozhi%2Fota%2Fd%2F{syn}%2F"
+    encoded_slash_ref = f"https://passport.example/xiaozhi%2Fota%2Fd%2F{syn}%2F"
+    encoded_letter_1 = f"https://passport.example/%78iaozhi/ota/d/{syn}/"
+    encoded_letter_2 = f"https://passport.example/xiaozhi/%6fta/%64/{syn}/"
+    encoded_letter_3 = f"https://passport.example/%78%69%61%6f%7a%68%69/%6f%74%61/%64/{syn}/"
+    encoded_letter_4 = f"https://passport.example/xia%6fzhi/o%74a/%64/{syn}/"
+    encoded_letter_mixed = f"https://passport.example/xia%4fzhi/O%54a/%44/{syn}/"
+    dot_segment_ref = f"https://passport.example/xiaozhi/./foo/../ota//d/{syn}/"
+
+    for eq_url in (
+        secret_ref,
+        encoded_slash_ref,
+        encoded_letter_1,
+        encoded_letter_2,
+        encoded_letter_3,
+        encoded_letter_4,
+        dot_segment_ref,
+    ):
+        assert _nginx_normalize_uri(urlsplit(eq_url).path) == f"/xiaozhi/ota/d/{syn}/", eq_url
+    assert _nginx_normalize_uri(urlsplit(encoded_letter_mixed).path).lower() == f"/xiaozhi/ota/d/{syn}/".lower()
 
     # --- Caddy: 502 backend failure on secret route and normal route ---
     caddy_sinks = _caddy_log_sinks(caddy_text)
@@ -2067,39 +2410,95 @@ def test_proxy_runtime_error_logs_redacted() -> None:
     _drive("caddy", caddy_no_global, ctrl_sinks, [("POST", f"/xiaozhi/ota/d/{syn}/", None)])
     assert any(syn in line for s in ctrl_sinks for line in s["lines"]), "Caddy negative control failed to detect leak"
 
-    # --- Nginx: site error log on normal routes with secret-bearing Referer ---
+    # --- Nginx: site error log and access log across literal & equivalent percent-encoded Referers ---
     guards = _nginx_server_guards(nginx_text)
     assert ("$passport_unsafe_referer", 400) in guards, f"Missing server-level Referer guard: {guards}"
     site_err = re.search(r"^    error_log\s+(\S+)\s+(\w+);", nginx_text, re.MULTILINE)
     assert site_err and site_err.group(1) != "/dev/null", "site error_log must remain a real diagnostic log"
-    nginx_err_lines: list[str] = []
+    nginx_logs: dict[str, list[str]] = {"err": [], "access": []}
     nginx_status = _drive(
         "nginx",
         nginx_text,
-        nginx_err_lines,
+        nginx_logs,
         [
             ("POST", "/xiaozhi/ota/", secret_ref),
-            ("POST", "/xiaozhi/ota/", encoded_ref),
-            ("GET", "/xiaozhi/v1/", secret_ref),
+            ("POST", "/xiaozhi/ota/", encoded_slash_ref),
+            ("POST", "/xiaozhi/ota/", encoded_letter_1),
+            ("POST", "/xiaozhi/ota/", encoded_letter_2),
+            ("POST", "/xiaozhi/ota/", encoded_letter_3),
+            ("POST", "/xiaozhi/ota/", encoded_letter_4),
+            ("POST", "/xiaozhi/ota/", encoded_letter_mixed),
+            ("POST", "/xiaozhi/ota/", dot_segment_ref),
+            ("GET", "/xiaozhi/v1/", encoded_letter_3),
             ("POST", "/mcp/vision/explain", f"https://u:{syn}@passport.example/"),
+            ("POST", "/xiaozhi/ota/", f"https://passport.example/?token={syn}"),
             ("POST", "/xiaozhi/ota/", "https://passport.example/docs"),
+            ("POST", "/xiaozhi/ota/", "https://passport.example/"),
             ("POST", f"/xiaozhi/ota/d/{syn}/", None),
+            ("POST", f"/%78iaozhi/%6fta/%64/{syn}/", None),
+            ("POST", f"/%78iaozhi/%6fta/%64/{syn}/", encoded_letter_3),
         ],
     )
-    assert nginx_status == [400, 400, 400, 400, 502, 502], nginx_status
-    assert len(nginx_err_lines) == 1 and 'referrer: "https://passport.example/docs"' in nginx_err_lines[0], (
-        "nginx stand-in did not exercise the site error-log path for a benign Referer"
+    assert nginx_status == [400] * 12 + [502, 502, 502, 400], nginx_status
+    assert len(nginx_logs["err"]) == 1 and 'referrer: "https://passport.example/"' in nginx_logs["err"][0], (
+        f"nginx stand-in error_log unexpected: {nginx_logs['err']}"
     )
-    assert not any(syn in line for line in nginx_err_lines), "nginx site error log leaked OTA secret"
-    # Negative control: removing the server-level guard leaks the raw referrer.
+    assert len(nginx_logs["access"]) == 14, f"expected 14 access log entries, got {len(nginx_logs['access'])}"
+    assert "/xiaozhi/ota/d/[REDACTED]/" in nginx_logs["access"][-1]
+    assert not any(syn in line for line in nginx_logs["err"] + nginx_logs["access"]), (
+        "nginx template-driven stand-in leaked OTA secret into error_log or access_log"
+    )
+
+    # Negative control 1 (Round-3 bypass): reverting to Round-3 regex denylist + $passport_safe_referer
+    # leaks fixed-segment letter-percent-encoded OTA URLs into BOTH error_log AND access_log.
+    round3_maps = (
+        "map $http_referer $passport_safe_referer {\n"
+        "    ~(?i)xiaozhi(/|%2f)ota(/|%2f)d(/|%2f)  \"[REDACTED]\";\n"
+        "    ~://[^/\\s]*@          \"[REDACTED]\";\n"
+        "    ~\\?                   \"[REDACTED]\";\n"
+        "    default               $http_referer;\n"
+        "}\n"
+        "map $http_referer $passport_unsafe_referer {\n"
+        "    ~(?i)xiaozhi(/|%2f)ota(/|%2f)d(/|%2f)  1;\n"
+        "    ~://[^/\\s]*@          1;\n"
+        "    ~\\?                   1;\n"
+        "    default               0;\n"
+        "}\n"
+    )
+    nginx_round3 = re.sub(
+        r"map \$http_referer \$passport_unsafe_referer \{.*?\}",
+        lambda _m: round3_maps.rstrip(),
+        nginx_text,
+        count=1,
+        flags=re.DOTALL,
+    )
+    nginx_round3 = nginx_round3.replace('$status $body_bytes_sent "-"', '$status $body_bytes_sent "$passport_safe_referer"')
+    assert nginx_round3 != nginx_text
+    r3_logs: dict[str, list[str]] = {"err": [], "access": []}
+    r3_status = _drive(
+        "nginx",
+        nginx_round3,
+        r3_logs,
+        [("POST", "/xiaozhi/ota/", encoded_letter_1), ("POST", "/xiaozhi/ota/", encoded_letter_3)],
+    )
+    assert r3_status == [502, 502], f"Round-3 denylist unexpectedly blocked letter-encoded Referers: {r3_status}"
+    assert any(syn in line for line in r3_logs["err"]), "Round-3 negative control failed to leak into error_log"
+    assert any(syn in line for line in r3_logs["access"]), "Round-3 negative control failed to leak into access_log"
+
+    # Negative control 2: removing the server-level guard leaks raw referrer into error_log while access_log stays clean.
     nginx_no_guard = re.sub(
         r"\n\s*if \(\$passport_unsafe_referer\) \{\s*return 400;\s*\}", "", nginx_text, count=1
     )
     assert nginx_no_guard != nginx_text
-    ctrl_lines: list[str] = []
-    _drive("nginx", nginx_no_guard, ctrl_lines, [("POST", "/xiaozhi/ota/", secret_ref)])
-    assert any(syn in line for line in ctrl_lines), "nginx negative control failed to detect leak"
-    print("[PASS] round-2: Caddy/Nginx backend-failure runtime/error logs record zero OTA secrets")
+    ctrl_logs: dict[str, list[str]] = {"err": [], "access": []}
+    ctrl_status = _drive("nginx", nginx_no_guard, ctrl_logs, [("POST", "/xiaozhi/ota/", encoded_letter_3)])
+    assert ctrl_status == [502]
+    assert any(syn in line for line in ctrl_logs["err"]), "nginx guard-removal negative control failed to detect error_log leak"
+    assert not any(syn in line for line in ctrl_logs["access"]), "access_log should remain redacted even without guard"
+    print(
+        "[PASS] round-2/3: Caddy/Nginx template-driven stand-ins (no real nginx binary in sandbox) "
+        "record zero OTA secrets across literal & letter-percent-encoded equivalents"
+    )
 
 
 def test_async_asr_nonblocking_disk_io(server_home: Path, fake_port: int) -> None:
@@ -3319,6 +3718,7 @@ def main() -> None:
     test_real_mode_refuses_disabled_or_missing_auth(server_home)
     test_real_vs_demo_config_persistence(server_home)
     test_demo_isolation_preserves_real_state(server_home)
+    test_demo_pip_controlled_install_isolation(server_home)
     test_proxy_runtime_error_logs_redacted()
 
     with tempfile.TemporaryDirectory() as tmpdir:

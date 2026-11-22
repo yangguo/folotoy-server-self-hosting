@@ -13,20 +13,22 @@
 #   in X-OTA-Secret, and strip tracing/URI headers (X-Original-URI, Referer, etc.).
 # - All other routes use `log_format passport_safe`, which replaces any OTA
 #   secret path segment or query string via `map` and omits Authorization,
-#   X-OTA-Secret, Cookie, and raw $request / $request_uri / $args / $http_referer.
+#   X-OTA-Secret, Cookie, raw $request / $request_uri / $args, and any Referer
+#   variable (emitting literal `"-"` for the Referer field).
 # - The site error log (`passport_error.log`) cannot be field-filtered and nginx
-#   appends the raw client Referer to its lines, so a server-level guard
-#   (`$passport_unsafe_referer` -> `return 400`) rejects Referers that contain an
-#   OTA secret path (incl. %2F-encoded), userinfo, or a query string before any
-#   location / proxy / body-size error can be logged.
+#   appends the raw client Referer to its lines, so a server-level strict
+#   allowlist guard (`$passport_unsafe_referer` -> `return 400`) rejects any
+#   Referer other than absent/empty or a bare HTTP(S) origin (`scheme://host[:port][/]`)
+#   before any location / proxy / body-size error can be logged, blocking literal,
+#   percent-encoded, dot-segment, userinfo, and query-bearing Referers alike.
 # - If APM / OpenTelemetry / WAF / ingress tracing is enabled on this proxy,
 #   disable trace capture or scrub `http.target`, `url.path`, `url.full`, and
 #   `http.url` on `/xiaozhi/ota/d/*` so per-device secrets do not enter traces.
 
 # --- BEGIN http {} scope (e.g. /etc/nginx/conf.d/passport-logging.conf) ---
 map $uri $passport_safe_uri {
-    ~(?i)/xiaozhi/ota/d/  "/xiaozhi/ota/d/[REDACTED]/";
-    default               $uri;
+    ~(?i)/xiaozhi/+ota/+d/  "/xiaozhi/ota/d/[REDACTED]/";
+    default                 $uri;
 }
 
 map $is_args $passport_safe_query {
@@ -34,28 +36,26 @@ map $is_args $passport_safe_query {
     default "";
 }
 
-map $http_referer $passport_safe_referer {
-    ~(?i)xiaozhi(/|%2f)ota(/|%2f)d(/|%2f)  "[REDACTED]";
-    ~://[^/\s]*@          "[REDACTED]";
-    ~\?                   "[REDACTED]";
-    default               $http_referer;
-}
-
 # Nginx's error log cannot filter fields: every error-log line for a request
 # (e.g. `connect() failed ... while connecting to upstream`) appends the RAW
-# client `referrer: "..."`. Requests whose Referer could carry a device OTA URL,
-# userinfo, or a query string are therefore rejected at server level (see the
-# `if ($passport_unsafe_referer)` guard) before any error-producing phase.
+# client `referrer: "..."`. A regex denylist on raw $http_referer can be bypassed
+# by percent-encoding path-segment letters (which nginx decodes when routing
+# $uri), dot-segments, or repeated slashes. Instead, enforce a strict allowlist:
+# only absent/empty Referer (all ESP32 firmware requests) or a bare HTTP(S)
+# origin (`scheme://host[:port][/]`, no path segments, userinfo, query, fragment,
+# or percent-encoding) is permitted; everything else is rejected at server level
+# before any error-producing phase.
 map $http_referer $passport_unsafe_referer {
-    ~(?i)xiaozhi(/|%2f)ota(/|%2f)d(/|%2f)  1;
-    ~://[^/\s]*@          1;
-    ~\?                   1;
-    default               0;
+    ""                                                          0;
+    ~*^https?://([A-Za-z0-9.-]+|\[[0-9A-Fa-f:]+\])(:[0-9]+)?/?$ 0;
+    default                                                     1;
 }
 
+# Access logs omit $http_referer completely (emitting literal `"-"`) so no
+# client-supplied Referer encoding can ever write OTA credentials to access logs.
 log_format passport_safe '$remote_addr - [$time_local] '
                          '"$request_method $passport_safe_uri$passport_safe_query $server_protocol" '
-                         '$status $body_bytes_sent "$passport_safe_referer" '
+                         '$status $body_bytes_sent "-" '
                          '"$http_user_agent" req_id=$request_id';
 # --- END http {} scope ---
 
@@ -72,10 +72,11 @@ server {
     error_log  /var/log/nginx/passport_error.log warn;
 
     # Site error-log guard: nginx appends the raw client Referer to every
-    # error-log line (upstream failures, body-size errors, ...). Reject unsafe
-    # Referers here, in the server-rewrite phase (before location matching,
-    # client_max_body_size checks, and proxying), so they can never reach
-    # passport_error.log. `return` itself writes nothing to the error log.
+    # error-log line (upstream failures, body-size errors, ...). Reject any
+    # Referer not matching the empty/bare-origin allowlist here, in the
+    # server-rewrite phase (before location matching, client_max_body_size
+    # checks, and proxying), so equivalent percent-encoded/normalized OTA paths
+    # can never reach passport_error.log. `return` writes nothing to error_log.
     if ($passport_unsafe_referer) {
         return 400;
     }
