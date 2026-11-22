@@ -2,18 +2,32 @@
 # Start the pinned xiaozhi-server as a local process (demo mode) and run both
 # the tightened contract test and the full regression suite.
 # Docker is optional; this path does not call xiaozhi.me or a paid model API.
+#
+# Isolation boundary: every writable output (state, logs, generated config) and
+# every dependency install goes under $DEMO_RUNTIME. An existing real
+# runtime/venv and upstream checkout are only reused read-only.
 set -eu
 
 ROOT=$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)
 RUNTIME="$ROOT/runtime"
 DEMO_RUNTIME="${PASSPORT_DEMO_RUNTIME:-$ROOT/runtime-demo}"
 DEMO_HOME="$DEMO_RUNTIME/xiaozhi-home"
+DEMO_VENV="$DEMO_RUNTIME/venv"
+SHARED_VENV="$RUNTIME/venv"
 SHA=8f2dda09cf18f1c1ece0f906eee4cc2fabb7fb58
-SRC="$RUNTIME/xiaozhi-esp32-server"
+if [ -d "$RUNTIME/xiaozhi-esp32-server/.git" ]; then
+  # Read-only reuse of an existing pinned checkout (verified clean below).
+  SRC="$RUNTIME/xiaozhi-esp32-server"
+else
+  SRC="$DEMO_RUNTIME/xiaozhi-esp32-server"
+fi
 SERVER="$SRC/main/xiaozhi-server"
-VENV="$RUNTIME/venv"
 UPSTREAM_REPO="${PASSPORT_UPSTREAM_REPO:-https://github.com/xinnan-tech/xiaozhi-esp32-server.git}"
-mkdir -p "$RUNTIME"
+
+# The demo must never inherit the real signing key or redirect pip elsewhere.
+unset PASSPORT_AUTH_KEY PIP_TARGET PIP_PREFIX PIP_ROOT PIP_USER
+# Never write bytecode into the read-only shared venv / upstream checkout.
+export PYTHONDONTWRITEBYTECODE=1
 
 pick_python() {
   if [ -n "${PASSPORT_PYTHON:-}" ] && [ -x "${PASSPORT_PYTHON}" ]; then
@@ -37,8 +51,8 @@ pick_python() {
 
 PY_BIN=$(pick_python)
 
-# Refuse before creating any demo directory if demo paths point inside real runtime/.
-"$PY_BIN" - "$RUNTIME" "$DEMO_RUNTIME" "$DEMO_HOME" "$DEMO_RUNTIME/devices.yaml" "$DEMO_RUNTIME/auth_key" "$DEMO_HOME/tmp" <<'PY'
+guard_paths() {
+  "$PY_BIN" - "$RUNTIME" "$@" <<'PY'
 import pathlib, sys
 real_runtime = pathlib.Path(sys.argv[1]).resolve()
 for raw in sys.argv[2:]:
@@ -46,8 +60,23 @@ for raw in sys.argv[2:]:
     if cand == real_runtime or real_runtime in cand.parents:
         sys.exit(f"Refusing demo run with path inside real runtime directory: {cand}")
 PY
+}
+
+# Refuse before creating any demo directory if demo dirs point inside real runtime/.
+guard_paths "$DEMO_RUNTIME" "$DEMO_HOME" "$DEMO_HOME/tmp" "$DEMO_HOME/data" "$DEMO_VENV"
 
 mkdir -p "$DEMO_RUNTIME" "$DEMO_HOME/data" "$DEMO_HOME/tmp"
+
+# Writable outputs are recreated on every run. `rm -f` unlinks a pre-existing
+# symlink / hard link at that path without touching its target, so the shell
+# `>` redirections and writers below can never truncate or rewrite real files.
+set -- "$DEMO_RUNTIME/fake-provider.log" "$DEMO_RUNTIME/xiaozhi-server.log" \
+  "$DEMO_RUNTIME/devices.yaml" "$DEMO_RUNTIME/auth_key" \
+  "$DEMO_HOME/tmp/server.log" "$DEMO_HOME/data/.config.yaml"
+for out in "$@"; do
+  rm -f "$out"
+done
+guard_paths "$@"
 
 if [ ! -d "$SRC/.git" ]; then
   git clone --depth 1 --branch v0.9.8 "$UPSTREAM_REPO" "$SRC"
@@ -62,15 +91,34 @@ if ! git -C "$SRC" diff --quiet || ! git -C "$SRC" diff --cached --quiet; then
   exit 1
 fi
 
-if [ ! -x "$VENV/bin/python" ]; then
-  "$PY_BIN" -m venv "$VENV"
+# Demo-only venv. When a shared runtime/venv exists, its site-packages are
+# exposed read-only via a .pth file; pip can only install into $DEMO_VENV.
+if [ ! -x "$DEMO_VENV/bin/python" ]; then
+  if [ -x "$SHARED_VENV/bin/python" ]; then
+    "$SHARED_VENV/bin/python" -m venv "$DEMO_VENV"
+  else
+    "$PY_BIN" -m venv "$DEMO_VENV"
+  fi
+fi
+if [ -x "$SHARED_VENV/bin/python" ]; then
+  SHARED_INFO=$("$SHARED_VENV/bin/python" -c 'import sys, sysconfig; print("%d.%d" % sys.version_info[:2]); print(sysconfig.get_paths()["purelib"])')
+  "$DEMO_VENV/bin/python" - "$SHARED_INFO" <<'PY'
+import pathlib, sys, sysconfig
+shared_ver, shared_site = sys.argv[1].splitlines()[:2]
+target = pathlib.Path(sysconfig.get_paths()["purelib"]) / "zz_passport_shared_readonly.pth"
+if shared_ver == "%d.%d" % sys.version_info[:2]:
+    target.write_text(f"import site; site.addsitedir({shared_site!r})\n", encoding="utf-8")
+elif target.exists():
+    target.unlink()
+PY
 fi
 if [ "${PASSPORT_SKIP_PIP:-0}" != "1" ]; then
-  "$VENV/bin/pip" install --disable-pip-version-check -r "$ROOT/requirements-runtime.txt"
+  "$DEMO_VENV/bin/python" -m pip install --disable-pip-version-check -r "$ROOT/requirements-runtime.txt"
 fi
+PYV="$DEMO_VENV/bin/python"
 
 ONNX_DEST="$SERVER/models/snakers4_silero-vad/src/silero_vad/data/silero_vad.onnx"
-"$VENV/bin/python" - <<PY
+"$PYV" - <<PY
 import hashlib, pathlib
 p = pathlib.Path("$ONNX_DEST")
 digest = hashlib.sha256(p.read_bytes()).hexdigest()
@@ -100,20 +148,19 @@ export PASSPORT_PUBLIC_HTTP="${PASSPORT_PUBLIC_HTTP:-http://${PASSPORT_BIND}:${P
 export PASSPORT_FAKE_BASE="${PASSPORT_FAKE_BASE:-http://127.0.0.1:${PASSPORT_FAKE_PORT}}"
 
 # Provision a fresh ephemeral contract-test device inside DEMO_RUNTIME only.
-rm -f "$PASSPORT_DEVICES_FILE"
-CONTRACT_SECRET=$("$VENV/bin/python" - <<'PY'
+CONTRACT_SECRET=$("$PYV" - <<'PY'
 import secrets
 print("ctr_" + secrets.token_urlsafe(18))
 PY
 )
-"$VENV/bin/python" "$ROOT/scripts/provision_device.py" add \
+"$PYV" "$ROOT/scripts/provision_device.py" add \
   --devices-file "$PASSPORT_DEVICES_FILE" \
   --device-id "aa:bb:cc:dd:ee:10" \
   --client-id "passport-contract-client" \
   --name "contract-test-device" \
   --secret "$CONTRACT_SECRET" >/dev/null
 
-"$VENV/bin/python" "$ROOT/scripts/write_config.py"
+"$PYV" "$ROOT/scripts/write_config.py"
 
 cleanup() {
   if [ -n "${SERVER_PID:-}" ]; then kill "$SERVER_PID" 2>/dev/null || true; fi
@@ -121,10 +168,10 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-"$VENV/bin/python" "$ROOT/fake_provider.py" --host 127.0.0.1 --port "$PASSPORT_FAKE_PORT" \
+"$PYV" "$ROOT/fake_provider.py" --host 127.0.0.1 --port "$PASSPORT_FAKE_PORT" \
   > "$DEMO_RUNTIME/fake-provider.log" 2>&1 &
 FAKE_PID=$!
-"$VENV/bin/python" "$ROOT/passport_server/runner.py" > "$DEMO_RUNTIME/xiaozhi-server.log" 2>&1 &
+"$PYV" "$ROOT/passport_server/runner.py" > "$DEMO_RUNTIME/xiaozhi-server.log" 2>&1 &
 SERVER_PID=$!
 
 ready=0
@@ -149,7 +196,7 @@ if [ "$ready" -ne 1 ]; then
 fi
 
 PASSPORT_TEST_OTA_SECRET="$CONTRACT_SECRET" \
-  "$VENV/bin/python" "$ROOT/scripts/contract_test.py" \
+  "$PYV" "$ROOT/scripts/contract_test.py" \
     --ota "http://${PASSPORT_BIND}:${PASSPORT_HTTP_BIND_PORT}" \
     --fake-control "http://127.0.0.1:${PASSPORT_FAKE_PORT}"
 
@@ -162,7 +209,7 @@ wait "$FAKE_PID" 2>/dev/null || true
 FAKE_PID=""
 
 if [ "${PASSPORT_SKIP_REGRESSION:-0}" != "1" ]; then
-  XIAOZHI_HOME="$SERVER" "$VENV/bin/python" "$ROOT/scripts/regression_test.py"
+  XIAOZHI_HOME="$SERVER" "$PYV" "$ROOT/scripts/regression_test.py"
 fi
 echo "demo runtime: $DEMO_RUNTIME"
 echo "server log: $DEMO_RUNTIME/xiaozhi-server.log"

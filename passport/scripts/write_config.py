@@ -53,6 +53,29 @@ def _assert_not_real_runtime_path(path_value: Path, label: str) -> None:
 
 
 def _resolve_auth_key(config_auth_key: str, mode: str) -> str:
+    if mode == "demo":
+        # Demo mode NEVER inherits the real signing key: PASSPORT_AUTH_KEY (which
+        # may hold the production key in the operator's shell / .env) and any
+        # auth_key embedded in the selected config are ignored. The demo key
+        # always comes from its own isolated PASSPORT_AUTH_FILE.
+        if os.environ.get("PASSPORT_AUTH_KEY", "").strip():
+            print(
+                "WARNING: Ignoring PASSPORT_AUTH_KEY because PASSPORT_MODE=demo; "
+                "demo uses its own isolated auth key file.",
+                file=sys.stderr,
+            )
+        key_file = Path(os.environ.get("PASSPORT_AUTH_FILE") or (ROOT / "runtime-demo" / "auth_key"))
+        _assert_not_real_runtime_path(key_file, "PASSPORT_AUTH_FILE")
+        try:
+            return ensure_private_secret_file(
+                key_file,
+                lambda: secrets.token_hex(32),
+                _is_valid_auth_key,
+                mode=0o600,
+            )
+        except ValueError as exc:
+            sys.exit(f"Existing demo auth_key file {key_file} is invalid or shorter than 32 chars ({exc})")
+
     env_key = os.environ.get("PASSPORT_AUTH_KEY", "").strip()
     if env_key:
         if not _is_valid_auth_key(env_key):

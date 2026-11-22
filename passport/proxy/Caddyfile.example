@@ -9,8 +9,46 @@
 #   `Authorization`, `X-Ota-Secret`, `Cookie`, `Referer`) to `[REDACTED]`.
 # - Extracts the per-device secret from `/xiaozhi/ota/d/<secret>/` into
 #   `X-OTA-Secret`, rewrites to `/xiaozhi/ota/`, and strips tracing URI headers.
+# - Runtime/error logs: when a backend fails (e.g. dial refused -> 502), Caddy's
+#   `http.log.error` and `http.handlers.reverse_proxy` loggers embed the ORIGINAL
+#   request (captured before `rewrite`, so `request>uri` can still contain
+#   `/xiaozhi/ota/d/<secret>/`) plus raw headers such as Referer. `log_skip` and
+#   the site access-log filter do NOT apply to them. The global options block
+#   below therefore excludes those loggers from the unfiltered default log and
+#   routes them to a dedicated sink with the same field filters.
 # - If external APM / OpenTelemetry / WAF instrumentation is attached, disable or
 #   scrub `http.target`, `url.path`, `url.full`, and `http.url` on `/xiaozhi/ota/d/*`.
+
+# Global options block (must be the first block in the Caddyfile).
+{
+    log default {
+        output stderr
+        exclude http.log.error http.handlers.reverse_proxy
+    }
+    log passport_runtime_errors {
+        include http.log.error http.handlers.reverse_proxy
+        output file /var/log/caddy/passport_error.log
+        format filter {
+            wrap json
+            fields {
+                request>uri replace "[REDACTED]"
+                request>orig_uri replace "[REDACTED]"
+                request>headers>Authorization replace "[REDACTED]"
+                request>headers>X-Ota-Secret replace "[REDACTED]"
+                request>headers>X-Api-Key replace "[REDACTED]"
+                request>headers>X-Auth-Token replace "[REDACTED]"
+                request>headers>Cookie replace "[REDACTED]"
+                request>headers>Referer replace "[REDACTED]"
+                request>headers>X-Original-Uri replace "[REDACTED]"
+                request>headers>X-Original-Url replace "[REDACTED]"
+                request>headers>X-Rewrite-Url replace "[REDACTED]"
+                request>headers>X-Forwarded-Uri replace "[REDACTED]"
+                request>headers>X-Envoy-Original-Path replace "[REDACTED]"
+                request>headers>X-Request-Uri replace "[REDACTED]"
+            }
+        }
+    }
+}
 
 your-passport-host.example.com {
     log {

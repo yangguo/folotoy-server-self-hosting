@@ -12,6 +12,7 @@ import logging
 import os
 import re
 import secrets
+import shlex
 import shutil
 import signal
 import socket
@@ -1074,6 +1075,75 @@ def test_real_vs_demo_config_persistence(server_home: Path) -> None:
     print("[PASS] blocker #4: real config preserved across entrypoint.sh restarts and separated from demo mode")
 
 
+def _tree_signature(root: Path) -> dict[str, tuple[int, int]]:
+    """Name/size/mtime signature of a tree (ignoring __pycache__) to detect installs."""
+    sig: dict[str, tuple[int, int]] = {}
+    base = root.resolve()
+    for dirpath, dirnames, filenames in os.walk(base):
+        dirnames[:] = [d for d in dirnames if d != "__pycache__"]
+        for name in dirnames:
+            sig[str(Path(dirpath, name).relative_to(base)) + "/"] = (0, 0)
+        for name in filenames:
+            path = Path(dirpath, name)
+            st = path.lstat()
+            sig[str(path.relative_to(base))] = (st.st_size, st.st_mtime_ns)
+    return sig
+
+
+def _compose_env_dict(value) -> dict[str, str]:
+    if isinstance(value, dict):
+        return {str(k): ("" if v is None else str(v)) for k, v in value.items()}
+    out: dict[str, str] = {}
+    for item in value or []:
+        key, _, val = str(item).partition("=")
+        out[key] = val
+    return out
+
+
+def _compose_merge(base: dict, override: dict) -> dict:
+    """Model of `docker compose -f base -f override` merge rules for the fields we use."""
+    import copy
+
+    merged = copy.deepcopy(base)
+    if "name" in override:
+        merged["name"] = override["name"]
+    services = merged.setdefault("services", {})
+    for svc_name, o_cfg in (override.get("services") or {}).items():
+        b_cfg = services.setdefault(svc_name, {})
+        for key, val in o_cfg.items():
+            if key == "environment":
+                env = _compose_env_dict(b_cfg.get("environment"))
+                env.update(_compose_env_dict(val))
+                b_cfg[key] = env
+            elif key == "volumes":
+                by_target: dict[str, str] = {}
+                for vol in list(b_cfg.get("volumes") or []) + list(val or []):
+                    by_target[str(vol).split(":")[1]] = str(vol)
+                b_cfg[key] = list(by_target.values())
+            elif key == "ports":
+                b_cfg[key] = list(dict.fromkeys([str(p) for p in (b_cfg.get("ports") or []) + list(val or [])]))
+            elif isinstance(val, dict) and isinstance(b_cfg.get(key), dict):
+                b_cfg[key] = {**b_cfg[key], **val}
+            else:
+                b_cfg[key] = copy.deepcopy(val)
+    for svc in services.values():
+        if "environment" in svc:
+            svc["environment"] = _compose_env_dict(svc["environment"])
+    return merged
+
+
+def _compose_project_name(argv: list[str], env: dict[str, str], file_name: str) -> str:
+    """Compose precedence: -p/--project-name > COMPOSE_PROJECT_NAME > top-level name."""
+    for idx, arg in enumerate(argv):
+        if arg in ("-p", "--project-name") and idx + 1 < len(argv):
+            return argv[idx + 1]
+        if arg.startswith("--project-name="):
+            return arg.split("=", 1)[1]
+    if env.get("COMPOSE_PROJECT_NAME"):
+        return env["COMPOSE_PROJECT_NAME"]
+    return file_name
+
+
 def test_demo_isolation_preserves_real_state(server_home: Path) -> None:
     """Blocker #1: run_isolated.sh & demo Compose MUST NOT delete or alter real devices.yaml / auth_key / config."""
     real_files = [
@@ -1123,28 +1193,125 @@ def test_demo_isolation_preserves_real_state(server_home: Path) -> None:
         atomic_write_private(copy_auth, secrets.token_hex(32) + "\n", mode=0o600)
         copy_before = _snapshot_files([copy_devices, copy_auth])
 
+        # Pre-seed every demo output path as a link to a "real" state file: shell
+        # `>` redirections and writers must unlink, never truncate/rewrite targets.
+        demo_root = passport_copy / "runtime-demo"
+        (demo_root / "xiaozhi-home" / "tmp").mkdir(parents=True)
+        (demo_root / "xiaozhi-home" / "data").mkdir(parents=True)
+        real_srv_log = copy_runtime / "real-server.log"
+        real_cfg_yaml = copy_runtime / "real-config.yaml"
+        real_fake_log = copy_runtime / "real-fake.log"
+        for real_path in (real_srv_log, real_cfg_yaml, real_fake_log):
+            real_path.write_text(f"real-state-{real_path.name}\n", encoding="utf-8")
+        symlinked_outputs = {
+            demo_root / "xiaozhi-server.log": copy_devices,
+            demo_root / "auth_key": copy_auth,
+            demo_root / "devices.yaml": copy_devices,
+            demo_root / "xiaozhi-home" / "tmp" / "server.log": real_srv_log,
+            demo_root / "xiaozhi-home" / "data" / ".config.yaml": real_cfg_yaml,
+        }
+        for link_path, target in symlinked_outputs.items():
+            link_path.symlink_to(target)
+        hardlinked_output = demo_root / "fake-provider.log"
+        os.link(real_fake_log, hardlinked_output)
+        linked_before = _snapshot_files([real_srv_log, real_cfg_yaml, real_fake_log])
+        copy_entries_before = sorted(p.name for p in copy_runtime.iterdir())
+        real_entries_before = sorted(p.name for p in (ROOT / "runtime").iterdir())
+        shared_venv_before = _tree_signature(ROOT / "runtime" / "venv")
+        # Synthetic stand-in for an operator's real signing key left in the env.
+        synthetic_real_key = secrets.token_hex(32)
+
         # Exercise default $ROOT/runtime-demo by leaving PASSPORT_DEMO_RUNTIME unset.
+        # pip runs (offline "already satisfied" via the read-only shared venv) so
+        # the test proves dependency installation never writes the shared venv.
         demo_res = subprocess.run(
             ["sh", str(passport_copy / "scripts" / "run_isolated.sh")],
             env=_base_env(
                 PASSPORT_SKIP_REGRESSION="1",
-                PASSPORT_SKIP_PIP="1",
                 PASSPORT_PYTHON=sys.executable,
+                PASSPORT_AUTH_KEY=synthetic_real_key,
                 PASSPORT_WS_BIND_PORT=str(_free_port()),
                 PASSPORT_HTTP_BIND_PORT=str(_free_port()),
                 PASSPORT_FAKE_PORT=str(_free_port()),
             ),
             capture_output=True,
             text=True,
-            timeout=120,
+            timeout=180,
         )
         assert demo_res.returncode == 0, (
-            f"isolated run_isolated.sh failed ({demo_res.returncode}):\n{demo_res.stdout}\n{demo_res.stderr}"
+            f"isolated run_isolated.sh failed ({demo_res.returncode}):\n"
+            f"{redact_text(demo_res.stdout)}\n{redact_text(demo_res.stderr)}"
         )
         assert "PASSED tightened upstream websocket contract with local fake providers" in demo_res.stdout
 
         _assert_files_unchanged(copy_before, "isolated copy runtime/")
         _assert_files_unchanged(real_before, "real passport/runtime/")
+        _assert_files_unchanged(linked_before, "demo output link targets")
+        for link_path in list(symlinked_outputs) + [hardlinked_output]:
+            assert link_path.is_file() and not link_path.is_symlink(), (
+                f"demo output {link_path} still a link after run_isolated.sh"
+            )
+        assert os.stat(hardlinked_output).st_ino != os.stat(real_fake_log).st_ino, (
+            "demo fake-provider.log still hard-linked to a real file"
+        )
+        assert sorted(p.name for p in copy_runtime.iterdir()) == copy_entries_before, (
+            "run_isolated.sh created/removed entries in the copy's real runtime/"
+        )
+        assert sorted(p.name for p in (ROOT / "runtime").iterdir()) == real_entries_before, (
+            "run_isolated.sh created/removed entries in real passport/runtime/"
+        )
+        assert _tree_signature(ROOT / "runtime" / "venv") == shared_venv_before, (
+            "run_isolated.sh dependency install modified the shared runtime/venv"
+        )
+        demo_venv = demo_root / "venv"
+        assert (demo_venv / "bin" / "python").exists() and not demo_venv.is_symlink()
+        assert (ROOT / "runtime").resolve() not in demo_venv.resolve().parents
+
+        # Demo must use its own key source, never the inherited PASSPORT_AUTH_KEY.
+        assert synthetic_real_key not in demo_res.stdout + demo_res.stderr
+        demo_rendered = yaml.safe_load(
+            (demo_root / "xiaozhi-home" / "data" / ".config.yaml").read_text(encoding="utf-8")
+        )
+        demo_key = (demo_root / "auth_key").read_text(encoding="utf-8").strip()
+        assert demo_rendered["server"]["auth_key"] == demo_key != synthetic_real_key
+        for dirpath, dirnames, filenames in os.walk(demo_root):
+            dirnames[:] = [d for d in dirnames if Path(dirpath, d) != demo_venv]
+            for fname in filenames:
+                fpath = Path(dirpath, fname)
+                if fpath.is_file():
+                    assert synthetic_real_key.encode() not in fpath.read_bytes(), (
+                        f"inherited PASSPORT_AUTH_KEY leaked into demo output {fpath.name}"
+                    )
+
+        # write_config.py demo mode directly: env key and config-embedded key ignored.
+        wc_home = tmp / "wc_demo_home"
+        (wc_home / "data").mkdir(parents=True)
+        cfg_key = secrets.token_hex(32)
+        wc_cfg_data = yaml.safe_load((ROOT / "config" / "demo.config.yaml").read_text(encoding="utf-8"))
+        wc_cfg_data["server"]["auth_key"] = cfg_key
+        wc_cfg = tmp / "wc_demo_cfg.yaml"
+        wc_cfg.write_text(yaml.safe_dump(wc_cfg_data), encoding="utf-8")
+        wc_res = subprocess.run(
+            [sys.executable, str(ROOT / "scripts" / "write_config.py")],
+            env=_base_env(
+                XIAOZHI_HOME=str(wc_home),
+                PASSPORT_MODE="demo",
+                PASSPORT_CONFIG_FILE=str(wc_cfg),
+                PASSPORT_AUTH_KEY=synthetic_real_key,
+                PASSPORT_AUTH_FILE=str(tmp / "wc_demo_auth"),
+                PASSPORT_DEVICES_FILE=str(tmp / "wc_demo_devices.yaml"),
+            ),
+            capture_output=True,
+            text=True,
+        )
+        assert wc_res.returncode == 0, f"demo write_config failed: {redact_text(wc_res.stderr)}"
+        wc_text = (wc_home / "data" / ".config.yaml").read_text(encoding="utf-8")
+        assert synthetic_real_key not in wc_text and cfg_key not in wc_text, (
+            "demo write_config.py rendered an inherited/real signing key"
+        )
+        assert yaml.safe_load(wc_text)["server"]["auth_key"] == (tmp / "wc_demo_auth").read_text(
+            encoding="utf-8"
+        ).strip()
 
         demo_root = passport_copy / "runtime-demo"
         for expected_file in (
@@ -1222,6 +1389,59 @@ def test_demo_isolation_preserves_real_state(server_home: Path) -> None:
             f"docker-compose.demo.yml mounts real runtime volume: {vol}"
         )
     assert "/opt/passport/runtime/" not in str(demo_cfg["server"]["auth"].get("devices_file") or "")
+
+    # Effective (merged) Compose model for the documented demo command, evaluated
+    # with COMPOSE_PROJECT_NAME already set to the REAL project name in the env.
+    prod_name = str(prod_compose["name"])
+    demo_name = str(demo_compose["name"])
+    doc_cmds = []
+    for doc in (ROOT / "README.zh_CN.md", ROOT / "docker-compose.yml", ROOT / "docker-compose.demo.yml"):
+        for line in doc.read_text(encoding="utf-8").splitlines():
+            if "docker compose" in line and "docker-compose.demo.yml" in line:
+                doc_cmds.append(line.lstrip("# ").strip())
+    assert doc_cmds, "No documented demo docker compose command found"
+    for cmd in doc_cmds:
+        argv = shlex.split(cmd)
+        files = [argv[i + 1] for i, a in enumerate(argv) if a == "-f"]
+        assert files == ["docker-compose.yml", "docker-compose.demo.yml"], f"Unexpected compose files in: {cmd}"
+        eff_name = _compose_project_name(argv, {"COMPOSE_PROJECT_NAME": prod_name}, demo_name)
+        assert eff_name == demo_name != prod_name, (
+            f"Documented demo command resolves to project {eff_name!r} when COMPOSE_PROJECT_NAME={prod_name!r}: {cmd}"
+        )
+    merged = _compose_merge(prod_compose, demo_compose)
+    assert set(merged["services"]) == {"xiaozhi-server", "fake-provider"}, merged["services"].keys()
+    m_srv = merged["services"]["xiaozhi-server"]
+    m_env = m_srv["environment"]
+    assert m_env["PASSPORT_MODE"] == "demo"
+    assert m_env["PASSPORT_CONFIG_FILE"] == "/opt/passport/config/demo.config.yaml"
+    assert m_env.get("PASSPORT_AUTH_KEY") == "", "merged demo service must blank PASSPORT_AUTH_KEY"
+    mounts = {str(v).split(":")[1]: str(v).split(":")[0] for v in m_srv["volumes"]}
+    assert mounts["/opt/passport/runtime"] == "./runtime-compose-demo", mounts
+    assert mounts["/opt/xiaozhi-esp32-server/data"] == "./runtime-compose-demo/data", mounts
+    for src in mounts.values():
+        assert src != "./runtime" and not src.startswith("./runtime/"), f"merged demo mounts real runtime: {src}"
+    fake_svc = merged["services"]["fake-provider"]
+    assert not fake_svc.get("ports"), "fake-provider must not publish host ports"
+    assert [str(v) for v in fake_svc.get("volumes") or []] == ["./fake_provider.py:/opt/passport/fake_provider.py:ro"]
+
+    docker_bin = shutil.which("docker")
+    if docker_bin:
+        cfg_cmd = shlex.split(doc_cmds[0])
+        up_idx = cfg_cmd.index("up")
+        cfg_res = subprocess.run(
+            [docker_bin] + cfg_cmd[1:up_idx] + ["config", "--format", "json"],
+            cwd=str(ROOT),
+            env={**os.environ, "COMPOSE_PROJECT_NAME": prod_name, "PASSPORT_AUTH_KEY": secrets.token_hex(32)},
+            capture_output=True,
+            text=True,
+        )
+        if cfg_res.returncode == 0:
+            real_cfg = json.loads(cfg_res.stdout)
+            assert real_cfg.get("name") == demo_name
+            assert real_cfg["services"]["xiaozhi-server"]["environment"].get("PASSPORT_AUTH_KEY") == ""
+            print("[PASS] docker compose config confirms demo project name and blank PASSPORT_AUTH_KEY")
+    else:
+        print("[INFO] docker CLI unavailable; Compose merge verified with in-test merge model only")
     print("[PASS] blocker #1: demo script and Compose override strictly isolated; real runtime files byte-identical")
 
 
@@ -1417,16 +1637,17 @@ def test_reverse_proxy_templates_and_forwarding(ota_base: str, dev_a: dict) -> N
 
             if query and PROXY_SENSITIVE_QUERY_RE.search(query):
                 resp_body = b'{"success":false,"message":"query credentials forbidden"}'
-                self.send_response(400)
-                self.send_header("Content-Type", "application/json")
-                self.send_header("Content-Length", str(len(resp_body)))
-                self.end_headers()
-                self.wfile.write(resp_body)
+                # Record the access-log line before replying so the client never races the log.
                 if not is_secret_prefix:
                     with proxy_lock:
                         proxy_access_logs.append(
                             self._safe_log_line(method, path, query, 400, len(resp_body), referer)
                         )
+                self.send_response(400)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(resp_body)))
+                self.end_headers()
+                self.wfile.write(resp_body)
                 return
 
             forward_headers = {}
@@ -1481,16 +1702,16 @@ def test_reverse_proxy_templates_and_forwarding(ota_base: str, dev_a: dict) -> N
                 if not is_secret_prefix:
                     with proxy_lock:
                         proxy_error_logs.append(f"upstream HTTP {status} on {target_path}")
-            self.send_response(status)
-            self.send_header("Content-Type", ctype)
-            self.send_header("Content-Length", str(len(resp_body)))
-            self.end_headers()
-            self.wfile.write(resp_body)
             if not is_secret_prefix:
                 with proxy_lock:
                     proxy_access_logs.append(
                         self._safe_log_line(method, path, query, status, len(resp_body), referer)
                     )
+            self.send_response(status)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(resp_body)))
+            self.end_headers()
+            self.wfile.write(resp_body)
 
         def do_GET(self):
             self._handle("GET")
@@ -1556,6 +1777,329 @@ def test_reverse_proxy_templates_and_forwarding(ota_base: str, dev_a: dict) -> N
         proxy_srv.server_close()
 
     print("[PASS] blocker #2: Nginx/Caddy templates validated and proxy OTA forwarding logs zero secrets")
+
+
+def _caddy_parse_blocks(text: str) -> list[dict]:
+    """Minimal Caddyfile block parser: [{'tokens': [...], 'children': [...]|None}]."""
+    root: dict = {"tokens": [], "children": []}
+    stack = [root]
+    for raw in text.splitlines():
+        toks = shlex.split(raw, comments=True)
+        if not toks:
+            continue
+        if toks == ["}"]:
+            stack.pop()
+            assert stack, "Unbalanced Caddyfile braces"
+            continue
+        opens = toks[-1] == "{"
+        node = {"tokens": toks[:-1] if opens else toks, "children": [] if opens else None}
+        stack[-1]["children"].append(node)
+        if opens:
+            stack.append(node)
+    assert len(stack) == 1, "Unbalanced Caddyfile braces"
+    return root["children"]
+
+
+def _caddy_log_sinks(caddy_text: str) -> list[dict]:
+    """Extract global `log` configs (include/exclude/filter fields) from a Caddyfile."""
+    blocks = _caddy_parse_blocks(caddy_text)
+    sinks: dict[str, dict] = {}
+    if blocks and blocks[0]["tokens"] == []:
+        for child in blocks[0]["children"] or []:
+            if child["tokens"][:1] != ["log"]:
+                continue
+            name = child["tokens"][1] if len(child["tokens"]) > 1 else "default"
+            cfg = {"name": name, "include": [], "exclude": [], "fields": [], "lines": []}
+            for directive in child["children"] or []:
+                toks = directive["tokens"]
+                if toks[0] == "include":
+                    cfg["include"] += toks[1:]
+                elif toks[0] == "exclude":
+                    cfg["exclude"] += toks[1:]
+                elif toks[:2] == ["format", "filter"]:
+                    for sub in directive["children"] or []:
+                        if sub["tokens"] == ["fields"]:
+                            cfg["fields"] += [f["tokens"] for f in sub["children"] or []]
+                        elif sub["tokens"][0] != "wrap":
+                            cfg["fields"].append(sub["tokens"])
+            sinks[name] = cfg
+    sinks.setdefault("default", {"name": "default", "include": [], "exclude": [], "fields": [], "lines": []})
+    return list(sinks.values())
+
+
+def _caddy_emit(sinks: list[dict], logger: str, entry: dict) -> None:
+    """Route a log entry like Caddy's logging pipeline and apply `format filter` fields."""
+    import copy
+
+    def _matches(patterns: list[str]) -> bool:
+        return any(logger == p or logger.startswith(p + ".") for p in patterns)
+
+    for sink in sinks:
+        if sink["include"] and not _matches(sink["include"]):
+            continue
+        if _matches(sink["exclude"]):
+            continue
+        data = copy.deepcopy(entry)
+        data["logger"] = logger
+        for field in sink["fields"]:
+            path, action = field[0].split(">"), field[1] if len(field) > 1 else ""
+            node = data
+            for part in path[:-1]:
+                node = node.get(part) if isinstance(node, dict) else None
+                if node is None:
+                    break
+            if isinstance(node, dict) and path[-1] in node:
+                if action == "replace":
+                    node[path[-1]] = field[2] if len(field) > 2 else ""
+                elif action == "delete":
+                    node.pop(path[-1])
+        sink["lines"].append(json.dumps(data))
+
+
+def _nginx_server_guards(nginx_text: str) -> list[tuple[str, int]]:
+    """Server-level `if (...) { return N; }` guards located before the first location."""
+    server_m = re.search(r"^server\s*\{(.*?)^\s*location\b", nginx_text, re.DOTALL | re.MULTILINE)
+    assert server_m, "nginx template has no server block with locations"
+    preamble = "\n".join(
+        line for line in server_m.group(1).splitlines() if not line.lstrip().startswith("#")
+    )
+    return [
+        (cond.strip(), int(code))
+        for cond, code in re.findall(r"if\s*\((.*?)\)\s*\{\s*return\s+(\d+);\s*\}", preamble, re.DOTALL)
+    ]
+
+
+def _nginx_map_rules(nginx_text: str, var_name: str) -> tuple[str, list[tuple[Optional[re.Pattern], str]]]:
+    m = re.search(rf"map\s+\$(\w+)\s+\${re.escape(var_name)}\s*\{{(.*?)\}}", nginx_text, re.DOTALL)
+    assert m, f"Missing map ${var_name}"
+    rules: list[tuple[Optional[re.Pattern], str]] = []
+    for raw_line in m.group(2).splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        pat_raw, out_raw = line.rstrip(";").split(None, 1)
+        out_raw = out_raw.strip().strip('"')
+        if pat_raw == "default":
+            rules.append((None, out_raw))
+        elif pat_raw.startswith("~(?i)"):
+            rules.append((re.compile(pat_raw[5:], re.IGNORECASE), out_raw))
+        elif pat_raw.startswith("~*"):
+            rules.append((re.compile(pat_raw[2:], re.IGNORECASE), out_raw))
+        elif pat_raw.startswith("~"):
+            rules.append((re.compile(pat_raw[1:]), out_raw))
+        else:
+            rules.append((re.compile("^" + re.escape(pat_raw.strip('"')) + "$"), out_raw))
+    return m.group(1), rules
+
+
+def test_proxy_runtime_error_logs_redacted() -> None:
+    """Round-2 blockers 1 & 2: backend-failure (502) runtime/error logs never record OTA secrets.
+
+    No nginx/caddy binaries are available, so in-process HTTP stand-ins are driven
+    by the parsed templates: Caddy's global log include/exclude + filter fields and
+    nginx's server-level guards. On a dead upstream they emit error entries exactly
+    as the real servers do (Caddy: original pre-rewrite request + headers; nginx:
+    raw request line + raw `referrer:`). Negative controls prove the stand-ins
+    detect the leak when the template protection is removed.
+    """
+    caddy_text = (ROOT / "proxy" / "Caddyfile.example").read_text(encoding="utf-8")
+    nginx_text = (ROOT / "proxy" / "nginx-passport.conf.example").read_text(encoding="utf-8")
+    syn = "errlog_ota_" + secrets.token_hex(12)
+    dead_port = _free_port()  # nothing listens here -> connection refused
+
+    def _upstream_fails() -> bool:
+        try:
+            socket.create_connection(("127.0.0.1", dead_port), timeout=1).close()
+            return False
+        except OSError:
+            return True
+
+    caddy_re_m = re.search(r"path_regexp\s+ota\s+(\S+)", caddy_text)
+    assert caddy_re_m
+    caddy_secret_re = re.compile(caddy_re_m.group(1))
+
+    def _make_handler(flavor: str, template: str, sinks):
+        guards = _nginx_server_guards(template) if flavor == "nginx" else []
+        site_err_m = re.search(r"^    error_log\s+(\S+)\s+(\w+);", template, re.MULTILINE) if flavor == "nginx" else None
+        ota_d_block_m = re.search(r"location\s+\^~\s+/xiaozhi/ota/d/\s*\{(.*?)\n    \}", template, re.DOTALL)
+
+        def _guard_hit(cond: str, path: str, query: str, headers) -> bool:
+            var_m = re.fullmatch(r"\$(\w+)", cond)
+            if var_m:
+                src, rules = _nginx_map_rules(template, var_m.group(1))
+                src_val = {"http_referer": headers.get("Referer", ""), "args": query, "uri": path}[src]
+                out = ""
+                for pat, val in rules:
+                    if pat is None or pat.search(src_val):
+                        out = src_val if val.startswith("$") else val
+                        break
+                return out not in ("", "0")
+            args_m = re.fullmatch(r'\$args\s+~\*\s+"(.*)"', cond)
+            if args_m:
+                return bool(re.search(args_m.group(1), query, re.IGNORECASE))
+            raise AssertionError(f"Unsupported nginx server guard: {cond}")
+
+        class _Handler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def log_message(self, fmt, *args):
+                pass
+
+            def _reply(self, status: int) -> None:
+                body = b"{}"
+                self.send_response(status)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def _handle(self) -> None:
+                length = int(self.headers.get("Content-Length", "0"))
+                if length:
+                    self.rfile.read(length)
+                parsed = urlsplit(self.path)
+                path, query = parsed.path, parsed.query
+                if flavor == "nginx":
+                    for cond, code in guards:
+                        if _guard_hit(cond, path, query, self.headers):
+                            self._reply(code)  # `return` writes nothing to error_log
+                            return
+                    in_secret_loc = path.startswith("/xiaozhi/ota/d/")
+                    err_sink_null = in_secret_loc and ota_d_block_m and "error_log /dev/null emerg;" in ota_d_block_m.group(1)
+                    if not _upstream_fails():
+                        raise AssertionError("dead upstream port unexpectedly accepted")
+                    if not err_sink_null and site_err_m:
+                        line = (
+                            f"[error] connect() failed (111: Connection refused) while connecting to upstream, "
+                            f'client: 127.0.0.1, server: passport, request: "{self.requestline}", '
+                            f'upstream: "http://127.0.0.1:{dead_port}/xiaozhi/ota/", host: "{self.headers.get("Host", "")}"'
+                        )
+                        if self.headers.get("Referer"):
+                            line += f', referrer: "{self.headers["Referer"]}"'
+                        sinks.append(line)
+                    self._reply(502)
+                    return
+                # Caddy: original request is captured before `rewrite` for error logs.
+                original_request = {
+                    "remote_ip": "127.0.0.1",
+                    "method": self.command,
+                    "host": self.headers.get("Host", ""),
+                    "uri": self.path,
+                    "headers": {k: [v] for k, v in self.headers.items()},
+                }
+                if caddy_secret_re.match(path):
+                    pass  # rewrite * /xiaozhi/ota/ happens on a copy; logs keep original
+                if not _upstream_fails():
+                    raise AssertionError("dead upstream port unexpectedly accepted")
+                _caddy_emit(
+                    sinks,
+                    "http.handlers.reverse_proxy",
+                    {"level": "error", "msg": "aborting with incomplete response", "request": original_request},
+                )
+                _caddy_emit(
+                    sinks,
+                    "http.log.error.log0",
+                    {
+                        "level": "error",
+                        "msg": f"dial tcp 127.0.0.1:{dead_port}: connect: connection refused",
+                        "request": original_request,
+                        "status": 502,
+                    },
+                )
+                self._reply(502)
+
+            def do_GET(self):
+                self._handle()
+
+            def do_POST(self):
+                self._handle()
+
+        return _Handler
+
+    def _drive(flavor: str, template: str, sinks, requests_spec) -> list[int]:
+        srv = ThreadingHTTPServer(("127.0.0.1", _free_port()), _make_handler(flavor, template, sinks))
+        srv.daemon_threads = True
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        statuses = []
+        try:
+            base = f"http://127.0.0.1:{srv.server_address[1]}"
+            for method, path, referer in requests_spec:
+                headers = {"Content-Type": "application/json", "Device-Id": "aa:bb:cc:dd:ee:99"}
+                if referer:
+                    headers["Referer"] = referer
+                req = urllib.request.Request(
+                    base + path, data=b"{}" if method == "POST" else None, headers=headers, method=method
+                )
+                try:
+                    with urllib.request.urlopen(req, timeout=5) as resp:
+                        statuses.append(resp.status)
+                except urllib.error.HTTPError as exc:
+                    exc.read()
+                    statuses.append(exc.code)
+        finally:
+            srv.shutdown()
+            srv.server_close()
+        return statuses
+
+    secret_ref = f"https://passport.example/xiaozhi/ota/d/{syn}/"
+    encoded_ref = f"https://passport.example/xiaozhi%2Fota%2Fd%2F{syn}%2F"
+
+    # --- Caddy: 502 backend failure on secret route and normal route ---
+    caddy_sinks = _caddy_log_sinks(caddy_text)
+    caddy_status = _drive(
+        "caddy",
+        caddy_text,
+        caddy_sinks,
+        [("POST", f"/xiaozhi/ota/d/{syn}/", secret_ref), ("POST", "/xiaozhi/ota/", secret_ref)],
+    )
+    assert caddy_status == [502, 502], caddy_status
+    err_sink = [s for s in caddy_sinks if "http.log.error" in s["include"]]
+    assert err_sink and len(err_sink[0]["lines"]) >= 4, "Caddy runtime error sink did not receive failure entries"
+    assert any('"[REDACTED]"' in line for line in err_sink[0]["lines"])
+    default_sink = [s for s in caddy_sinks if s["name"] == "default"][0]
+    assert not any("http.log.error" in line or "reverse_proxy" in line for line in default_sink["lines"])
+    for sink in caddy_sinks:
+        for line in sink["lines"]:
+            assert syn not in line, f"Caddy {sink['name']} log leaked OTA secret on backend failure"
+    # Negative control: without the global log block the default (unfiltered) log leaks.
+    caddy_no_global = re.sub(r"^\{\n.*?^\}\n", "", caddy_text, count=1, flags=re.DOTALL | re.MULTILINE)
+    assert caddy_no_global != caddy_text
+    ctrl_sinks = _caddy_log_sinks(caddy_no_global)
+    _drive("caddy", caddy_no_global, ctrl_sinks, [("POST", f"/xiaozhi/ota/d/{syn}/", None)])
+    assert any(syn in line for s in ctrl_sinks for line in s["lines"]), "Caddy negative control failed to detect leak"
+
+    # --- Nginx: site error log on normal routes with secret-bearing Referer ---
+    guards = _nginx_server_guards(nginx_text)
+    assert ("$passport_unsafe_referer", 400) in guards, f"Missing server-level Referer guard: {guards}"
+    site_err = re.search(r"^    error_log\s+(\S+)\s+(\w+);", nginx_text, re.MULTILINE)
+    assert site_err and site_err.group(1) != "/dev/null", "site error_log must remain a real diagnostic log"
+    nginx_err_lines: list[str] = []
+    nginx_status = _drive(
+        "nginx",
+        nginx_text,
+        nginx_err_lines,
+        [
+            ("POST", "/xiaozhi/ota/", secret_ref),
+            ("POST", "/xiaozhi/ota/", encoded_ref),
+            ("GET", "/xiaozhi/v1/", secret_ref),
+            ("POST", "/mcp/vision/explain", f"https://u:{syn}@passport.example/"),
+            ("POST", "/xiaozhi/ota/", "https://passport.example/docs"),
+            ("POST", f"/xiaozhi/ota/d/{syn}/", None),
+        ],
+    )
+    assert nginx_status == [400, 400, 400, 400, 502, 502], nginx_status
+    assert len(nginx_err_lines) == 1 and 'referrer: "https://passport.example/docs"' in nginx_err_lines[0], (
+        "nginx stand-in did not exercise the site error-log path for a benign Referer"
+    )
+    assert not any(syn in line for line in nginx_err_lines), "nginx site error log leaked OTA secret"
+    # Negative control: removing the server-level guard leaks the raw referrer.
+    nginx_no_guard = re.sub(
+        r"\n\s*if \(\$passport_unsafe_referer\) \{\s*return 400;\s*\}", "", nginx_text, count=1
+    )
+    assert nginx_no_guard != nginx_text
+    ctrl_lines: list[str] = []
+    _drive("nginx", nginx_no_guard, ctrl_lines, [("POST", "/xiaozhi/ota/", secret_ref)])
+    assert any(syn in line for line in ctrl_lines), "nginx negative control failed to detect leak"
+    print("[PASS] round-2: Caddy/Nginx backend-failure runtime/error logs record zero OTA secrets")
 
 
 def test_async_asr_nonblocking_disk_io(server_home: Path, fake_port: int) -> None:
@@ -2775,6 +3319,7 @@ def main() -> None:
     test_real_mode_refuses_disabled_or_missing_auth(server_home)
     test_real_vs_demo_config_persistence(server_home)
     test_demo_isolation_preserves_real_state(server_home)
+    test_proxy_runtime_error_logs_redacted()
 
     with tempfile.TemporaryDirectory() as tmpdir:
         tmp = Path(tmpdir)

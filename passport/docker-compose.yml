@@ -8,7 +8,7 @@
 #    python passport/scripts/provision_device.py add ...
 #
 # For isolated fake-provider contract/demo testing instead, run:
-#   docker compose -f docker-compose.yml -f docker-compose.demo.yml up --build
+#   docker compose -p folotoy-passport-demo -f docker-compose.yml -f docker-compose.demo.yml up --build
 name: folotoy-passport
 
 services:

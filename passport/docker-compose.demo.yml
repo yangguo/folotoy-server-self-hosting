@@ -1,6 +1,7 @@
 # Explicit demo / contract-test Compose override using fake_provider.py.
-# Usage:
-#   docker compose -f docker-compose.yml -f docker-compose.demo.yml up --build
+# Usage (always pass -p: COMPOSE_PROJECT_NAME in the environment would otherwise
+# override the `name:` below and could reuse the real Compose project):
+#   docker compose -p folotoy-passport-demo -f docker-compose.yml -f docker-compose.demo.yml up --build
 #
 # Uses a separate Compose project name and isolated ./runtime-compose-demo state
 # directory so real ./runtime/devices.yaml, auth_key, and data/.config.yaml are
@@ -28,6 +29,8 @@ services:
       PASSPORT_FAKE_BASE: http://fake-provider:18019
       PASSPORT_PUBLIC_WS: ws://127.0.0.1:18010/xiaozhi/v1/
       PASSPORT_PUBLIC_HTTP: http://127.0.0.1:18013/mcp/vision/explain
+      # Never inherit the real signing key from the host shell or passport/.env.
+      PASSPORT_AUTH_KEY: ""
     volumes:
       - ./config:/opt/passport/config:ro
       - ./runtime-compose-demo:/opt/passport/runtime

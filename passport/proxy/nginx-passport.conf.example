@@ -14,6 +14,11 @@
 # - All other routes use `log_format passport_safe`, which replaces any OTA
 #   secret path segment or query string via `map` and omits Authorization,
 #   X-OTA-Secret, Cookie, and raw $request / $request_uri / $args / $http_referer.
+# - The site error log (`passport_error.log`) cannot be field-filtered and nginx
+#   appends the raw client Referer to its lines, so a server-level guard
+#   (`$passport_unsafe_referer` -> `return 400`) rejects Referers that contain an
+#   OTA secret path (incl. %2F-encoded), userinfo, or a query string before any
+#   location / proxy / body-size error can be logged.
 # - If APM / OpenTelemetry / WAF / ingress tracing is enabled on this proxy,
 #   disable trace capture or scrub `http.target`, `url.path`, `url.full`, and
 #   `http.url` on `/xiaozhi/ota/d/*` so per-device secrets do not enter traces.
@@ -30,10 +35,22 @@ map $is_args $passport_safe_query {
 }
 
 map $http_referer $passport_safe_referer {
-    ~(?i)/xiaozhi/ota/d/  "[REDACTED]";
+    ~(?i)xiaozhi(/|%2f)ota(/|%2f)d(/|%2f)  "[REDACTED]";
     ~://[^/\s]*@          "[REDACTED]";
     ~\?                   "[REDACTED]";
     default               $http_referer;
+}
+
+# Nginx's error log cannot filter fields: every error-log line for a request
+# (e.g. `connect() failed ... while connecting to upstream`) appends the RAW
+# client `referrer: "..."`. Requests whose Referer could carry a device OTA URL,
+# userinfo, or a query string are therefore rejected at server level (see the
+# `if ($passport_unsafe_referer)` guard) before any error-producing phase.
+map $http_referer $passport_unsafe_referer {
+    ~(?i)xiaozhi(/|%2f)ota(/|%2f)d(/|%2f)  1;
+    ~://[^/\s]*@          1;
+    ~\?                   1;
+    default               0;
 }
 
 log_format passport_safe '$remote_addr - [$time_local] '
@@ -53,6 +70,15 @@ server {
 
     access_log /var/log/nginx/passport_access.log passport_safe;
     error_log  /var/log/nginx/passport_error.log warn;
+
+    # Site error-log guard: nginx appends the raw client Referer to every
+    # error-log line (upstream failures, body-size errors, ...). Reject unsafe
+    # Referers here, in the server-rewrite phase (before location matching,
+    # client_max_body_size checks, and proxying), so they can never reach
+    # passport_error.log. `return` itself writes nothing to the error log.
+    if ($passport_unsafe_referer) {
+        return 400;
+    }
 
     # Reject credentials passed in query strings before routing/proxying.
     if ($args ~* "(^|&)(authorization|token|access_token|refresh_token|id_token|secret|ota_secret|key|api_key|apikey|password|sig|signature|auth)=") {
