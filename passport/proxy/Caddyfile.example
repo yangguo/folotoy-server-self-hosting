@@ -16,19 +16,22 @@
 #   the site access-log filter do NOT apply to them. The global options block
 #   below therefore excludes those loggers from the unfiltered default log and
 #   routes them to a dedicated sink with the same field filters.
-# - Unsafe query guard: raw `{query}` regexes (`vars_regexp`) miss percent-
-#   encoded query keys such as `?%74oken=...`, while Caddy's `query` matcher is
-#   case-sensitive on keys (`?TOKEN=...` or `?%54oken=...` bypasses it).
-#   Because Passport routes require no query parameters except exact
-#   `/xiaozhi/v1/?from=mqtt_gateway`, `@unsafe_query` enforces a strict
-#   route-scoped CEL `expression` allowlist ahead of all `handle` /
-#   `reverse_proxy` directives inside an ordered `route { ... }` block and
-#   shares `log_skip @unsafe_query` with `respond @unsafe_query 400`.
-#   Observability trade-off: 400 rejections from `@unsafe_query` and all
-#   `/xiaozhi/ota/d/*` requests skip Caddy access logging; permitted non-secret
-#   traffic (e.g. `/xiaozhi/ota/`, `/xiaozhi/v1/?from=mqtt_gateway`) retains
-#   redacted JSON access logging, and backend errors (502) go only to the
-#   filtered `passport_error.log`.
+# - Unsafe path & query guards: raw `{query}` regexes (`vars_regexp`) miss
+#   percent-encoded query keys such as `?%74oken=...`, while Caddy's `query`
+#   matcher is case-sensitive on keys (`?TOKEN=...` or `?%54oken=...` bypasses
+#   it). Likewise, Caddy's `path` matcher cleans dot-segments and matches
+#   case-insensitively while `reverse_proxy` forwards the raw un-normalized
+#   request target (`{http.request.orig_uri}`), so `/xiaozhi/ota/d/<secret>/..`
+#   or `/xiaozhi/ota/d/<secret>/../../` can bypass `/xiaozhi/ota/d/*` and reach
+#   the HTTP upstream under `/xiaozhi/ota/*`. Therefore, `@unsafe_query` and
+#   `@unsafe_path` enforce strict route-scoped CEL `expression` allowlists
+#   ahead of all `handle` / `reverse_proxy` directives inside an ordered
+#   `route { ... }` block and share `log_skip` with `respond ... 400`.
+#   Observability trade-off: 400 rejections from `@unsafe_query` / `@unsafe_path`
+#   and all `/xiaozhi/ota/d/*` requests skip Caddy access logging; permitted
+#   non-secret canonical traffic (e.g. `/xiaozhi/ota/`,
+#   `/xiaozhi/v1/?from=mqtt_gateway`) retains redacted JSON access logging, and
+#   backend errors (502) go only to the filtered `passport_error.log`.
 # - If external APM / OpenTelemetry / WAF instrumentation is attached, disable or
 #   scrub `http.target`, `url.path`, `url.full`, and `http.url` on `/xiaozhi/ota/d/*`.
 
@@ -91,6 +94,10 @@ your-passport-host.example.com {
         expression `{query} != "" && !({path} == "/xiaozhi/v1/" && {query} == "from=mqtt_gateway")`
     }
 
+    @unsafe_path {
+        expression `!({http.request.orig_uri}.matches("^(/xiaozhi/ota/|/xiaozhi/ota/download/[A-Za-z0-9_][A-Za-z0-9._-]*|/mcp/vision/explain|/xiaozhi/v1/)(\\?.*)?$") || path("/xiaozhi/ota/d/*") || ({http.request.orig_uri} == {path} && !path("/xiaozhi/*", "/mcp/*") && !{path}.matches("(^|/)\\.{1,2}(/|$)|//")))`
+    }
+
     @ota_secret_path {
         path_regexp ota ^/xiaozhi/ota/d/([^/]+)/?$
     }
@@ -99,7 +106,9 @@ your-passport-host.example.com {
     route {
         log_skip @ota_secret_prefix
         log_skip @unsafe_query
+        log_skip @unsafe_path
         respond @unsafe_query 400
+        respond @unsafe_path 400
 
         handle @ota_secret_path {
             rewrite * /xiaozhi/ota/

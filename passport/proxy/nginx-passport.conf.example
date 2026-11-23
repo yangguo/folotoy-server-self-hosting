@@ -28,19 +28,35 @@
 #      denylist on raw `$args` or `$arg_*`), this map enforces a strict
 #      route-scoped allowlist on `"$is_args$args|$uri"`: only empty queries or
 #      the exact `/xiaozhi/v1/?from=mqtt_gateway` handshake query are allowed;
-#      all literal, percent-encoded, or unexpected query parameters are rejected
-#      at server level before any location / upstream error can be logged.
+#      all literal, percent-encoded, case-variant, or unexpected query parameters
+#      are rejected at server level before any location / upstream error can be
+#      logged.
+#   3) `$passport_unsafe_path` -> `return 400`: Nginx selects locations and
+#      `$passport_log_access` using normalized `$uri`, whereas `proxy_pass`
+#      (without a URI) and `error_log` (`connect() failed` / `[alert]`) emit
+#      the raw un-normalized request target (`$request_uri`). Paths containing
+#      OTA credentials and two or more dot-segments (e.g.
+#      `/xiaozhi/ota/d/<secret>/../../` or `/%78iaozhi/ota/d/<secret>/../../`)
+#      normalize to `/xiaozhi/ota/` (or `/xiaozhi/v1/`, `/mcp/vision/explain`,
+#      `/xiaozhi/ota/download/...`) and would enter ordinary locations, forwarding
+#      the raw credential-bearing target upstream and leaking it to site
+#      error_log. `$passport_unsafe_path` pairs `$passport_secret_ota_uri`
+#      (whether normalized `$uri` remains inside `/xiaozhi/ota/d/`) with raw
+#      `$request_uri` so every non-secret route must use its canonical raw path;
+#      traversal paths normalizing out of `/xiaozhi/ota/d/` are rejected with
+#      400 at server level before routing, proxying, or error/access logging.
 # - In addition, `access_log` uses `if=$passport_log_access` to skip access-log
-#   writes whenever `$passport_unsafe_referer` or `$passport_unsafe_query`
-#   rejects a request (or when a server-level guard rejects a `/xiaozhi/ota/d/`
-#   URI before location matching), preventing an access-log write failure /
-#   short write (`[alert]`) from leaking raw `Referer` or raw query-bearing
-#   request lines into `passport_error.log`.
-#   Observability trade-off: 400 rejections from `$passport_unsafe_referer` or
-#   `$passport_unsafe_query` are not written to `passport_access.log`;
-#   permitted requests (empty query or `/xiaozhi/v1/?from=mqtt_gateway`, with
-#   empty or bare-origin Referer on non-secret routes) keep full redacted
-#   access logging and error logging.
+#   writes whenever `$passport_unsafe_referer`, `$passport_unsafe_query`, or
+#   `$passport_unsafe_path` rejects a request, or whenever normalized `$uri` is
+#   in `/xiaozhi/ota/d/` (`$passport_secret_ota_uri`), preventing an access-log
+#   write failure / short write (`[alert]`) from leaking raw `Referer` or raw
+#   credential-bearing request lines into `passport_error.log`.
+#   Observability trade-off: 400 rejections from `$passport_unsafe_referer`,
+#   `$passport_unsafe_query`, or `$passport_unsafe_path` (as well as all
+#   `/xiaozhi/ota/d/` requests) are not written to `passport_access.log`;
+#   permitted requests on canonical non-secret routes (empty query or
+#   `/xiaozhi/v1/?from=mqtt_gateway`, with empty or bare-origin Referer) keep
+#   full redacted access logging and error logging.
 # - If APM / OpenTelemetry / WAF / ingress tracing is enabled on this proxy,
 #   disable trace capture or scrub `http.target`, `url.path`, `url.full`, and
 #   `http.url` on `/xiaozhi/ota/d/*` so per-device secrets do not enter traces.
@@ -83,27 +99,51 @@ map $http_referer $passport_unsafe_referer {
 # write (which on write failure / short write emits an `[alert]` containing the
 # raw request line).
 map "$is_args$args|$uri" $passport_unsafe_query {
-    ~^\|                               0;
-    "?from=mqtt_gateway|/xiaozhi/v1/"  0;
-    default                            1;
+    ~^\|                                  0;
+    ~^\?from=mqtt_gateway\|/xiaozhi/v1/$  0;
+    default                               1;
 }
 
-# Skip access_log writes whenever the Referer allowlist or query allowlist
-# rejects a request (or when a server-level guard rejects a
-# `/xiaozhi/ota/d/` URI before location matching). Otherwise, an access_log
-# write failure or short write causes Nginx (`ngx_http_log_write`) to emit an
-# `[alert]` to `r->connection->log`, whose error-log formatter appends the RAW
-# client `referrer` and RAW request line (including query parameter values).
-# Observability trade-off: 400 rejections from `$passport_unsafe_referer` or
-# `$passport_unsafe_query` are intentionally omitted from
-# `passport_access.log`; allowed requests (empty or bare-origin Referer with
-# empty query or exact `/xiaozhi/v1/?from=mqtt_gateway` on non-secret routes)
-# keep full redacted access & error logging.
-map "$passport_unsafe_referer:$passport_unsafe_query:$uri" $passport_log_access {
-    ~^1:                         0;
-    ~^0:1:                       0;
-    ~(?i)^0:0:/xiaozhi/+ota/+d/  0;
-    default                      1;
+# Detect requests whose normalized `$uri` remains inside `/xiaozhi/ota/d/`.
+# Single-dot traversals (e.g. `/xiaozhi/ota/d/<secret>/../`) normalize to
+# `/xiaozhi/ota/d/` and stay inside the secret location (access_log off,
+# error_log /dev/null emerg, returning 404 without hitting upstream).
+map $uri $passport_secret_ota_uri {
+    ~^/xiaozhi/ota/d/  1;
+    default            0;
+}
+
+# Require canonical raw `$request_uri` paths for all non-secret routes.
+# If a raw path carries OTA credentials + >=2 dot-segments (or percent-encoded
+# equivalents) that normalize out of `/xiaozhi/ota/d/` into `/xiaozhi/ota/`,
+# `/xiaozhi/v1/`, `/mcp/vision/explain`, or `/xiaozhi/ota/download/...`,
+# `$passport_secret_ota_uri` is 0 while raw `$request_uri` is non-canonical,
+# rejecting the request at server level before location matching, proxying, or
+# site error/access logging. Query validation remains orthogonal via
+# `$passport_unsafe_query`.
+map "$passport_secret_ota_uri:$request_uri" $passport_unsafe_path {
+    ~^1:                                                           0;
+    ~^0:/xiaozhi/ota/(\?.*)?$                                      0;
+    ~^0:/xiaozhi/ota/download/[A-Za-z0-9_][A-Za-z0-9._-]*(\?.*)?$  0;
+    ~^0:/mcp/vision/explain(\?.*)?$                                0;
+    ~^0:/xiaozhi/v1/(\?.*)?$                                       0;
+    default                                                        1;
+}
+
+# Skip access_log writes whenever the Referer allowlist, query allowlist, or
+# canonical path allowlist rejects a request, or when normalized `$uri` is in
+# `/xiaozhi/ota/d/`. Otherwise, an access_log write failure or short write
+# causes Nginx (`ngx_http_log_write`) to emit an `[alert]` to `r->connection->log`,
+# whose error-log formatter appends the RAW client `referrer` and RAW request
+# line (including query parameter values and un-normalized traversal paths).
+# Observability trade-off: 400 rejections from `$passport_unsafe_referer`,
+# `$passport_unsafe_query`, or `$passport_unsafe_path` are intentionally omitted
+# from `passport_access.log`; permitted canonical requests (empty or bare-origin
+# Referer with empty query or exact `/xiaozhi/v1/?from=mqtt_gateway` on
+# non-secret routes) keep full redacted access & error logging.
+map "$passport_unsafe_referer:$passport_unsafe_query:$passport_unsafe_path:$passport_secret_ota_uri" $passport_log_access {
+    "0:0:0:0"  1;
+    default    0;
 }
 
 # Access logs omit $http_referer completely (emitting literal `"-"`) so no
@@ -141,6 +181,13 @@ server {
     # Enforce the strict route-scoped query allowlist before routing/proxying
     # (shared with `$passport_log_access` so rejected queries skip access_log writes).
     if ($passport_unsafe_query) {
+        return 400;
+    }
+
+    # Enforce canonical raw request targets for non-secret routes before location
+    # matching so dot-segment or percent-encoded OTA paths normalizing out of
+    # `/xiaozhi/ota/d/` never reach ordinary locations, upstreams, or site logs.
+    if ($passport_unsafe_path) {
         return 400;
     }
 

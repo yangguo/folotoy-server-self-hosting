@@ -29,12 +29,15 @@ import threading
 import time
 import urllib.error
 import urllib.request
+import wave
 import zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Optional
 from urllib.parse import parse_qs, unquote, urlsplit
 
+import opuslib_next
+from opuslib_next import constants
 import websockets
 import yaml
 
@@ -2343,13 +2346,24 @@ def test_reverse_proxy_templates_and_forwarding(ota_base: str, dev_a: dict) -> N
     assert ref_src == "http_referer"
     unsafe_q_src, unsafe_q_rules = _nginx_map_rules(nginx_text, "passport_unsafe_query")
     assert unsafe_q_src == "$is_args$args|$uri"
-    assert ("$passport_unsafe_query", 400) in _nginx_server_guards(nginx_text), (
+    sec_uri_src, _ = _nginx_map_rules(nginx_text, "passport_secret_ota_uri")
+    assert sec_uri_src == "uri"
+    unsafe_p_src, _ = _nginx_map_rules(nginx_text, "passport_unsafe_path")
+    assert unsafe_p_src == "$passport_secret_ota_uri:$request_uri"
+    nginx_guards = _nginx_server_guards(nginx_text)
+    assert ("$passport_unsafe_query", 400) in nginx_guards, (
         "Missing shared server-level $passport_unsafe_query guard"
     )
-    log_src, _ = _nginx_map_rules(nginx_text, "passport_log_access")
-    assert "$passport_unsafe_referer" in log_src and "$passport_unsafe_query" in log_src and "$uri" in log_src, (
-        f"Unexpected $passport_log_access source expression: {log_src}"
+    assert ("$passport_unsafe_path", 400) in nginx_guards, (
+        "Missing shared server-level $passport_unsafe_path guard"
     )
+    log_src, _ = _nginx_map_rules(nginx_text, "passport_log_access")
+    assert (
+        "$passport_unsafe_referer" in log_src
+        and "$passport_unsafe_query" in log_src
+        and "$passport_unsafe_path" in log_src
+        and "$passport_secret_ota_uri" in log_src
+    ), f"Unexpected $passport_log_access source expression: {log_src}"
 
     syn_secret = "proxy_ota_" + secrets.token_hex(12)
     syn_qtok = "proxy_qtok_" + secrets.token_hex(10)
@@ -2412,6 +2426,7 @@ def test_reverse_proxy_templates_and_forwarding(ota_base: str, dev_a: dict) -> N
         ("/xiaozhi/ota/", f"probe={syn_qtok}"),
         ("/xiaozhi/ota/", "from=mqtt_gateway"),
         ("/xiaozhi/v1/", "%66rom=mqtt_gateway"),
+        ("/xiaozhi/v1/", "FROM=MQTT_GATEWAY"),
         ("/xiaozhi/v1/", "from=mqtt_gateway&extra=1"),
         ("/xiaozhi/v1/extra", "from=mqtt_gateway"),
     ):
@@ -2438,6 +2453,88 @@ def test_reverse_proxy_templates_and_forwarding(ota_base: str, dev_a: dict) -> N
 
     assert _eval_nginx_map(unsafe_q_rules, "|/xiaozhi/ota/") == "0"
     assert _eval_nginx_map(unsafe_q_rules, "?from=mqtt_gateway|/xiaozhi/v1/") == "0"
+
+    # Verify $passport_unsafe_path catches >=2 dot-segment & encoded OTA path traversals
+    # while keeping single-dot paths inside /xiaozhi/ota/d/ as negative controls (log_access=0).
+    for trav_raw in (
+        f"/xiaozhi/ota/d/{syn_secret}/../../",
+        f"/xiaozhi/ota/d/{syn_secret}/../..",
+        f"/xiaozhi/ota/d/{syn_secret}/%2e%2e/%2e%2e/",
+        f"/xiaozhi/ota/d/{syn_secret}/%2e%2e/%2e%2e",
+        f"/%78iaozhi/ota/d/{syn_secret}/../../",
+        f"/%78%69%61%6f%7a%68%69/%6f%74%61/%64/{syn_secret}/../../",
+        f"/xiaozhi/ota/d/{syn_secret}/..%2f../",
+        f"/%58iaozhi/%4fta/%44/{syn_secret}/../../",
+        f"/xiaozhi/ota/d/{syn_secret}/../../../",
+        f"/xiaozhi/ota/d/{syn_secret}/../../../../xiaozhi/v1/",
+        f"/xiaozhi/ota/d/{syn_secret}/../../../../mcp/vision/explain",
+        f"/xiaozhi/ota/d/{syn_secret}/../../download/fw_1.0.bin",
+    ):
+        trav_norm = _nginx_normalize_uri(trav_raw)
+        assert (
+            _eval_nginx_var(
+                nginx_text,
+                "passport_unsafe_path",
+                norm_path=trav_norm,
+                query="",
+                headers={},
+                raw_target=trav_raw,
+            )
+            == "1"
+        ), f"$passport_unsafe_path missed traversal {trav_raw} (norm={trav_norm})"
+        assert (
+            _eval_nginx_var(
+                nginx_text,
+                "passport_log_access",
+                norm_path=trav_norm,
+                query="",
+                headers={},
+                raw_target=trav_raw,
+            )
+            == "0"
+        )
+
+    for onedot_raw in (
+        f"/xiaozhi/ota/d/{syn_secret}/../",
+        f"/xiaozhi/ota/d/{syn_secret}/..",
+        f"/xiaozhi/ota/d/{syn_secret}/%2e%2e/",
+        f"/%78iaozhi/ota/d/{syn_secret}/../",
+    ):
+        onedot_norm = _nginx_normalize_uri(onedot_raw)
+        assert onedot_norm == "/xiaozhi/ota/d/", onedot_raw
+        assert (
+            _eval_nginx_var(
+                nginx_text,
+                "passport_secret_ota_uri",
+                norm_path=onedot_norm,
+                query="",
+                headers={},
+                raw_target=onedot_raw,
+            )
+            == "1"
+        )
+        assert (
+            _eval_nginx_var(
+                nginx_text,
+                "passport_unsafe_path",
+                norm_path=onedot_norm,
+                query="",
+                headers={},
+                raw_target=onedot_raw,
+            )
+            == "0"
+        )
+        assert (
+            _eval_nginx_var(
+                nginx_text,
+                "passport_log_access",
+                norm_path=onedot_norm,
+                query="",
+                headers={},
+                raw_target=onedot_raw,
+            )
+            == "0"
+        )
     assert (
         _eval_nginx_var(
             nginx_text,
@@ -2548,6 +2645,7 @@ def test_reverse_proxy_templates_and_forwarding(ota_base: str, dev_a: dict) -> N
     assert "@ota_secret_prefix path /xiaozhi/ota/d/*" in caddy_text
     assert "log_skip @ota_secret_prefix" in caddy_text
     assert "log_skip @unsafe_query" in caddy_text
+    assert "log_skip @unsafe_path" in caddy_text
     for caddy_field in (
         'request>uri replace "[REDACTED]"',
         'request>orig_uri replace "[REDACTED]"',
@@ -2566,10 +2664,15 @@ def test_reverse_proxy_templates_and_forwarding(ota_base: str, dev_a: dict) -> N
     assert "rewrite * /xiaozhi/ota/" in caddy_text
     assert "header_up X-OTA-Secret {re.ota.1}" in caddy_text
     assert "respond @unsafe_query 400" in caddy_text
+    assert "respond @unsafe_path 400" in caddy_text
     caddy_adapted = _caddy_adapt_site(caddy_text)
     cred_matcher = caddy_adapted["matchers"].get("@unsafe_query", [])
     assert cred_matcher and all(sub["kind"] == "expression" for sub in cred_matcher), (
         f"@unsafe_query must use route-scoped CEL expression allowlist: {cred_matcher}"
+    )
+    path_matcher = caddy_adapted["matchers"].get("@unsafe_path", [])
+    assert path_matcher and all(sub["kind"] == "expression" for sub in path_matcher), (
+        f"@unsafe_path must use route-scoped CEL expression allowlist: {path_matcher}"
     )
     assert len(caddy_adapted["routes"]) == 1 and caddy_adapted["routes"][0]["tokens"] == ["route"], (
         "Caddy site handlers must be wrapped inside an ordered `route { ... }` block"
@@ -2577,13 +2680,15 @@ def test_reverse_proxy_templates_and_forwarding(ota_base: str, dev_a: dict) -> N
     route_children = [c["tokens"] for c in caddy_adapted["routes"][0]["children"] or []]
     idx_log_skip = route_children.index(["log_skip", "@ota_secret_prefix"])
     idx_q_skip = route_children.index(["log_skip", "@unsafe_query"])
+    idx_p_skip = route_children.index(["log_skip", "@unsafe_path"])
     idx_resp_cred = route_children.index(["respond", "@unsafe_query", "400"])
+    idx_resp_path = route_children.index(["respond", "@unsafe_path", "400"])
     first_proxy_idx = min(
         i for i, toks in enumerate(route_children) if toks[0] in ("handle", "reverse_proxy")
     )
-    assert 0 <= idx_log_skip < idx_q_skip < idx_resp_cred < first_proxy_idx, (
-        f"Unexpected ordered Caddy route sequence: {route_children}"
-    )
+    assert (
+        0 <= idx_log_skip < idx_q_skip < idx_p_skip < idx_resp_cred < idx_resp_path < first_proxy_idx
+    ), f"Unexpected ordered Caddy route sequence: {route_children}"
     for caddy_strip in (
         "header_up -Authorization",
         "header_up -X-Original-URI",
@@ -2639,7 +2744,7 @@ def test_reverse_proxy_templates_and_forwarding(ota_base: str, dev_a: dict) -> N
             safe_uri = _eval_nginx_map(uri_rules, norm_path) + _eval_nginx_map(query_rules, "?" if query else "")
             return f'{self.address_string()} - "{method} {safe_uri} HTTP/1.1" {status} {length} "-"'
 
-        def _should_access_log(self, norm_path: str, query: str) -> bool:
+        def _should_access_log(self, raw_target: str, norm_path: str, query: str) -> bool:
             if norm_path.startswith("/xiaozhi/ota/d/"):
                 return False
             acc_m = re.search(r"^    access_log\s+(\S+)\s+(\w+)(?:\s+if=\$(\w+))?;", nginx_text, re.MULTILINE)
@@ -2648,7 +2753,14 @@ def test_reverse_proxy_templates_and_forwarding(ota_base: str, dev_a: dict) -> N
             cond_var = acc_m.group(3)
             if cond_var:
                 return (
-                    _eval_nginx_var(nginx_text, cond_var, norm_path=norm_path, query=query, headers=self.headers)
+                    _eval_nginx_var(
+                        nginx_text,
+                        cond_var,
+                        norm_path=norm_path,
+                        query=query,
+                        headers=self.headers,
+                        raw_target=raw_target,
+                    )
                     not in ("", "0")
                 )
             return True
@@ -2662,35 +2774,31 @@ def test_reverse_proxy_templates_and_forwarding(ota_base: str, dev_a: dict) -> N
             referer = self.headers.get("Referer", "")
             is_secret_prefix = norm_path.startswith("/xiaozhi/ota/d/")
 
-            # Server-level guard (`if ($passport_unsafe_referer) { return 400; }`) runs before location matching.
-            if _eval_nginx_map(unsafe_ref_rules, referer) not in ("", "0"):
-                resp_body = b'{"success":false,"message":"unsafe referer"}'
-                if self._should_access_log(norm_path, query):
-                    with proxy_lock:
-                        proxy_access_logs.append(self._safe_log_line(method, norm_path, query, 400, len(resp_body)))
-                self.send_response(400)
-                self.send_header("Content-Type", "application/json")
-                self.send_header("Content-Length", str(len(resp_body)))
-                self.end_headers()
-                self.wfile.write(resp_body)
-                return
-
-            if _eval_nginx_var(
-                nginx_text, "passport_unsafe_query", norm_path=norm_path, query=query, headers=self.headers
-            ) not in ("", "0"):
-                resp_body = b'{"success":false,"message":"unsafe query"}'
-                # Record the access-log line before replying so the client never races the log.
-                if self._should_access_log(norm_path, query):
-                    with proxy_lock:
-                        proxy_access_logs.append(
-                            self._safe_log_line(method, norm_path, query, 400, len(resp_body))
-                        )
-                self.send_response(400)
-                self.send_header("Content-Type", "application/json")
-                self.send_header("Content-Length", str(len(resp_body)))
-                self.end_headers()
-                self.wfile.write(resp_body)
-                return
+            # Server-level guards run before location matching.
+            for guard_cond, guard_code in nginx_guards:
+                g_m = re.fullmatch(r"\$(\w+)", guard_cond)
+                assert g_m, f"Unsupported nginx guard: {guard_cond}"
+                if (
+                    _eval_nginx_var(
+                        nginx_text,
+                        g_m.group(1),
+                        norm_path=norm_path,
+                        query=query,
+                        headers=self.headers,
+                        raw_target=self.path,
+                    )
+                    not in ("", "0")
+                ):
+                    resp_body = json.dumps({"success": False, "guard": g_m.group(1)}).encode("utf-8")
+                    if self._should_access_log(self.path, norm_path, query):
+                        with proxy_lock:
+                            proxy_access_logs.append(self._safe_log_line(method, norm_path, query, guard_code, len(resp_body)))
+                    self.send_response(guard_code)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(resp_body)))
+                    self.end_headers()
+                    self.wfile.write(resp_body)
+                    return
 
             forward_headers = {}
             for hk, hv in self.headers.items():
@@ -2745,7 +2853,7 @@ def test_reverse_proxy_templates_and_forwarding(ota_base: str, dev_a: dict) -> N
                 if not is_secret_prefix:
                     with proxy_lock:
                         proxy_error_logs.append(f"upstream HTTP {status} on {target_path}")
-            if self._should_access_log(norm_path, query):
+            if self._should_access_log(self.path, norm_path, query):
                 with proxy_lock:
                     proxy_access_logs.append(
                         self._safe_log_line(method, norm_path, query, status, len(resp_body))
@@ -2854,6 +2962,7 @@ def test_reverse_proxy_templates_and_forwarding(ota_base: str, dev_a: dict) -> N
             f"/xiaozhi/ota/?probe={benign_q}",
             "/xiaozhi/ota/?from=mqtt_gateway",
             "/xiaozhi/v1/?%66rom=mqtt_gateway",
+            "/xiaozhi/v1/?FROM=MQTT_GATEWAY",
             f"/xiaozhi/v1/?from=mqtt_gateway&%74oken={q_sentinel}",
         ):
             st_get_q, _ = post_json(
@@ -2865,6 +2974,29 @@ def test_reverse_proxy_templates_and_forwarding(ota_base: str, dev_a: dict) -> N
                 },
             )
             assert st_get_q == 400, f"Expected 400 on {bad_q_path}, got {st_get_q}"
+
+        # Raw two-dot traversals return 400 and single-dot returns 404 (both skip access log).
+        def _raw_proxy_status(target_url: str, raw_path: str) -> int:
+            u = urlsplit(target_url)
+            conn = http.client.HTTPConnection(u.hostname, u.port, timeout=5)
+            try:
+                conn.request("GET", raw_path, headers={"Connection": "close"})
+                r = conn.getresponse()
+                r.read()
+                return r.status
+            finally:
+                conn.close()
+
+        for trav_p in (
+            f"/xiaozhi/ota/d/{dev_a['ota_secret']}/../../",
+            f"/xiaozhi/ota/d/{dev_a['ota_secret']}/../..",
+            f"/xiaozhi/ota/d/{dev_a['ota_secret']}/%2e%2e/%2e%2e/",
+            f"/%78iaozhi/ota/d/{dev_a['ota_secret']}/../../",
+            f"/xiaozhi/ota/d/{dev_a['ota_secret']}/../../../",
+            f"/xiaozhi/ota/d/{dev_a['ota_secret']}/../../../../xiaozhi/v1/",
+        ):
+            assert _raw_proxy_status(proxy_base, trav_p) == 400, trav_p
+        assert _raw_proxy_status(proxy_base, f"/xiaozhi/ota/d/{dev_a['ota_secret']}/../") == 404
 
         joined_proxy_logs = "\n".join(proxy_access_logs + proxy_error_logs)
         assert len(proxy_access_logs) == 2, f"Expected only 2 safe access log entries, got: {proxy_access_logs}"
@@ -2992,14 +3124,39 @@ def test_reverse_proxy_templates_and_forwarding(ota_base: str, dev_a: dict) -> N
             f"/xiaozhi/v1/?api_key={caddy_q_sentinel}",
             f"/xiaozhi/v1/?%61pi_key={caddy_q_sentinel}",
             "/xiaozhi/v1/?%66rom=mqtt_gateway",
+            "/xiaozhi/v1/?FROM=MQTT_GATEWAY",
         ):
             try:
                 with urllib.request.urlopen(f"{caddy_base}{bad_get_path}", timeout=5):
                     raise AssertionError(f"Expected 400 on GET {bad_get_path}")
             except urllib.error.HTTPError as exc:
                 assert exc.code == 400, f"Unexpected GET status on {bad_get_path}: {exc.code}"
-        assert caddy_hits == [], f"Disallowed queries reached Caddy upstream: {caddy_hits}"
-        assert caddy_acc_sink["lines"] == [], f"@unsafe_query 400s leaked into Caddy access log: {caddy_acc_sink['lines']}"
+        for raw_trav_path in (
+            f"/xiaozhi/ota/d/{dev_a['ota_secret']}/..",
+            f"/xiaozhi/ota/d/{dev_a['ota_secret']}/../../",
+            f"/xiaozhi/ota/d/{dev_a['ota_secret']}/../..",
+            f"/xiaozhi/ota/d/{dev_a['ota_secret']}/%2e%2e/%2e%2e/",
+            f"/xiaozhi/ota/d/{dev_a['ota_secret']}/%2e%2e/%2e%2e",
+            f"/%78iaozhi/ota/d/{dev_a['ota_secret']}/../../",
+            f"/%78%69%61%6f%7a%68%69/%6f%74%61/%64/{dev_a['ota_secret']}/../../",
+            f"/xiaozhi/ota/d/{dev_a['ota_secret']}/..%2f../",
+            f"/%58iaozhi/%4fta/%44/{dev_a['ota_secret']}/../../",
+            f"/xiaozhi/ota/d/{dev_a['ota_secret']}/../../../",
+            f"/xiaozhi/ota/d/{dev_a['ota_secret']}/../../../../xiaozhi/v1/",
+            f"/xiaozhi/ota/d/{dev_a['ota_secret']}/../../../../mcp/vision/explain",
+            f"/xiaozhi/ota/d/{dev_a['ota_secret']}/../../download/fw_1.0.bin",
+        ):
+            st_raw_trav = _raw_proxy_status(caddy_base, raw_trav_path)
+            assert st_raw_trav == 400, f"Caddy model failed to reject {raw_trav_path}: {st_raw_trav}"
+        for raw_onedot_path in (
+            f"/xiaozhi/ota/d/{dev_a['ota_secret']}/../",
+            f"/xiaozhi/ota/d/{dev_a['ota_secret']}/%2e%2e/",
+            f"/%78iaozhi/ota/d/{dev_a['ota_secret']}/../",
+        ):
+            st_onedot = _raw_proxy_status(caddy_base, raw_onedot_path)
+            assert st_onedot == 404, f"Caddy model unexpected status on {raw_onedot_path}: {st_onedot}"
+        assert caddy_hits == [], f"Disallowed queries/paths reached Caddy upstream: {caddy_hits}"
+        assert caddy_acc_sink["lines"] == [], f"@unsafe_query/@unsafe_path/@ota_secret_prefix leaked into Caddy access log: {caddy_acc_sink['lines']}"
 
         # 2. Valid per-device OTA secret route rewrites to /xiaozhi/ota/, injects X-OTA-Secret,
         #    strips tracing headers, skips access logs, and returns live WS token.
@@ -3089,6 +3246,30 @@ def test_reverse_proxy_templates_and_forwarding(ota_base: str, dev_a: dict) -> N
     finally:
         neg_c_srv.shutdown()
         neg_c_srv.server_close()
+
+    # Caddy negative control D: removing `@unsafe_path` lets dot-segment OTA traversal paths hit HTTP upstream.
+    caddy_no_path = _caddy_strip_unsafe_path(caddy_text)
+    neg_d_srv, neg_d_base, neg_d_hits, _, _ = _drive_caddy_model(caddy_no_path)
+    try:
+        for trav_bypass in (
+            f"/xiaozhi/ota/d/{dev_a['ota_secret']}/../../",
+            f"/xiaozhi/ota/d/{dev_a['ota_secret']}/..",
+        ):
+            u_d = urlsplit(neg_d_base)
+            c_d = http.client.HTTPConnection(u_d.hostname, u_d.port, timeout=5)
+            try:
+                c_d.request("GET", trav_bypass, headers={"Connection": "close"})
+                r_d = c_d.getresponse()
+                r_d.read()
+                assert r_d.status in (200, 404), (trav_bypass, r_d.status)
+            finally:
+                c_d.close()
+        assert len(neg_d_hits) == 2 and all(dev_a["ota_secret"] in h[1] for h in neg_d_hits), (
+            f"Caddy negative control D failed to show traversal upstream hit: {neg_d_hits}"
+        )
+    finally:
+        neg_d_srv.shutdown()
+        neg_d_srv.server_close()
 
     print("[PASS] blocker #2: Nginx/Caddy templates validated and proxy OTA forwarding logs zero secrets")
 
@@ -3328,9 +3509,30 @@ def _caddy_adapt_site(caddy_text: str) -> dict:
     return {"matchers": matchers, "routes": _adapt_nodes(raw_directives, inside_route=False)}
 
 
+def _caddy_clean_path(raw_path: str) -> str:
+    """Model Go/Caddy path cleaning: decode %, merge slashes, resolve dot-segments, preserve literal trailing '/'."""
+    decoded = unquote(raw_path)
+    if not decoded.startswith("/"):
+        decoded = "/" + decoded
+    trailing_slash = decoded.endswith("/")
+    parts: list[str] = []
+    for seg in decoded.split("/"):
+        if not seg or seg == ".":
+            continue
+        if seg == "..":
+            if parts:
+                parts.pop()
+        else:
+            parts.append(seg)
+    cleaned = "/" + "/".join(parts)
+    if trailing_slash and cleaned != "/":
+        cleaned += "/"
+    return cleaned
+
+
 def _caddy_path_match(pattern: str, norm_path: str) -> bool:
     regex = "^" + re.escape(pattern).replace(r"\*", ".*") + "$"
-    return re.match(regex, norm_path) is not None
+    return re.match(regex, norm_path, re.IGNORECASE) is not None
 
 
 def _caddy_eval_matcher(matcher_ref: Optional[str], matchers: dict[str, list[dict]], req_state: dict) -> bool:
@@ -3360,7 +3562,7 @@ def _caddy_eval_matcher(matcher_ref: Optional[str], matchers: dict[str, list[dic
             elif field in ("{uri}", "{http.request.uri}"):
                 val = req_state["raw_uri"]
             elif field in ("{path}", "{http.request.uri.path}"):
-                val = req_state["norm_path"]
+                val = req_state["decoded_path"]
             else:
                 raise AssertionError(f"Unsupported vars_regexp field: {field}")
             m = sub["regex"].search(val)
@@ -3377,11 +3579,34 @@ def _caddy_eval_matcher(matcher_ref: Optional[str], matchers: dict[str, list[dic
             req_state["re_groups"][sub["name"]] = m
         elif kind == "expression":
             expr = sub["expr"]
-            expected = '{query} != "" && !({path} == "/xiaozhi/v1/" && {query} == "from=mqtt_gateway")'
-            assert expr == expected, f"Unsupported Caddy expression in test model: {expr!r}"
-            matched = bool(req_state["raw_query"]) and not (
-                req_state["norm_path"] == "/xiaozhi/v1/" and req_state["raw_query"] == "from=mqtt_gateway"
+            q_expected = '{query} != "" && !({path} == "/xiaozhi/v1/" && {query} == "from=mqtt_gateway")'
+            p_expected = (
+                '!({http.request.orig_uri}.matches("^(/xiaozhi/ota/|/xiaozhi/ota/download/'
+                '[A-Za-z0-9_][A-Za-z0-9._-]*|/mcp/vision/explain|/xiaozhi/v1/)(\\\\?.*)?$") '
+                '|| path("/xiaozhi/ota/d/*") || ({http.request.orig_uri} == {path} '
+                '&& !path("/xiaozhi/*", "/mcp/*") && !{path}.matches("(^|/)\\\\.{1,2}(/|$)|//")))'
             )
+            if expr == q_expected:
+                matched = bool(req_state["raw_query"]) and not (
+                    req_state["decoded_path"] == "/xiaozhi/v1/" and req_state["raw_query"] == "from=mqtt_gateway"
+                )
+            elif expr == p_expected:
+                allowed_canon = bool(
+                    re.match(
+                        r"^(/xiaozhi/ota/|/xiaozhi/ota/download/[A-Za-z0-9_][A-Za-z0-9._-]*|/mcp/vision/explain|/xiaozhi/v1/)(\?.*)?$",
+                        req_state["raw_uri"],
+                    )
+                )
+                in_secret_prefix = _caddy_path_match("/xiaozhi/ota/d/*", req_state["norm_path"])
+                clean_unknown = (
+                    req_state["raw_uri"] == req_state["decoded_path"]
+                    and not _caddy_path_match("/xiaozhi/*", req_state["norm_path"])
+                    and not _caddy_path_match("/mcp/*", req_state["norm_path"])
+                    and not re.search(r"(^|/)\.{1,2}(/|$)|//", req_state["decoded_path"])
+                )
+                matched = not (allowed_canon or in_secret_prefix or clean_unknown)
+            else:
+                raise AssertionError(f"Unsupported Caddy expression in test model: {expr!r}")
             if not matched:
                 return False
         else:
@@ -3402,7 +3627,8 @@ def _caddy_execute_routes(
 ) -> tuple[int, bytes, str]:
     """Execute adapted Caddy routes (in-process router model; NOT real Caddy)."""
     parsed = urlsplit(raw_target)
-    norm_path = _nginx_normalize_uri(parsed.path)
+    decoded_path = unquote(parsed.path)
+    norm_path = _caddy_clean_path(parsed.path)
     raw_query = parsed.query
 
     def _canon_hdr(name: str) -> str:
@@ -3417,10 +3643,12 @@ def _caddy_execute_routes(
     }
     req_state = {
         "raw_uri": raw_target,
+        "decoded_path": decoded_path,
         "norm_path": norm_path,
         "raw_query": raw_query,
         "headers": dict(headers),
         "re_groups": {},
+        "rewritten": False,
         "log_skip": False,
         "original_request": original_request,
     }
@@ -3446,6 +3674,7 @@ def _caddy_execute_routes(
                 new_target = toks[2]
                 if mref == "*" or _caddy_eval_matcher(mref, adapted["matchers"], req_state):
                     req_state["norm_path"] = new_target
+                    req_state["rewritten"] = True
             elif cmd == "request_body":
                 pass
             elif cmd == "route":
@@ -3488,7 +3717,12 @@ def _caddy_execute_routes(
                             for existing in [k for k in fwd_headers if k.lower() == h_arg.lower()]:
                                 fwd_headers.pop(existing, None)
                             fwd_headers[h_arg] = val
-                return upstream_fn(method, target_upstream, req_state["norm_path"], req_state["raw_query"], fwd_headers, body)
+                upstream_path = (
+                    req_state["norm_path"]
+                    if req_state["rewritten"]
+                    else req_state["raw_uri"].split("?", 1)[0]
+                )
+                return upstream_fn(method, target_upstream, upstream_path, req_state["raw_query"], fwd_headers, body)
             else:
                 raise AssertionError(f"Unsupported Caddy directive in model: {toks}")
         return None
@@ -3547,6 +3781,15 @@ def _caddy_strip_route_wrapper(caddy_text: str) -> str:
     dedented = "\n".join(line[4:] if line.startswith("    ") else line for line in m.group(1).splitlines())
     mutated = caddy_text[: m.start()] + "\n" + dedented + "\n}" + caddy_text[m.end() :]
     assert mutated != caddy_text
+    return mutated
+
+
+def _caddy_strip_unsafe_path(caddy_text: str) -> str:
+    """Mutant for negative control D: remove `@unsafe_path` guard so traversal paths reach HTTP upstream."""
+    mutated = re.sub(r"\n    @unsafe_path \{.*?\n    \}\n", "\n", caddy_text, count=1, flags=re.DOTALL)
+    mutated = mutated.replace("        log_skip @unsafe_path\n", "")
+    mutated = mutated.replace("        respond @unsafe_path 400\n", "")
+    assert mutated != caddy_text, "Failed to strip @unsafe_path from Caddyfile"
     return mutated
 
 
@@ -3623,7 +3866,8 @@ def _nginx_map_rules(nginx_text: str, var_name: str) -> tuple[str, list[tuple[Op
         elif pat_raw.startswith("~"):
             regex_rules.append((re.compile(pat_raw[1:]), out_raw))
         else:
-            exact_rules.append((re.compile("^" + re.escape(pat_raw.strip('"')) + "$"), out_raw))
+            # Official Nginx `map` string keys are case-insensitive unless prefixed by `~`.
+            exact_rules.append((re.compile("^" + re.escape(pat_raw.strip('"')) + "$", re.IGNORECASE), out_raw))
     return src_expr, exact_rules + regex_rules + default_rules
 
 
@@ -3634,12 +3878,17 @@ def _eval_nginx_var(
     norm_path: str,
     query: str,
     headers,
+    raw_target: Optional[str] = None,
     _seen: Optional[set[str]] = None,
 ) -> str:
     """Evaluate a request-scoped Nginx variable or composite `map` expression."""
     seen = set(_seen or ())
     if var_name == "uri":
         return norm_path
+    if var_name == "request_uri":
+        if raw_target is not None:
+            return raw_target
+        return norm_path + (f"?{query}" if query else "")
     if var_name == "is_args":
         return "?" if query else ""
     if var_name == "args":
@@ -3653,13 +3902,25 @@ def _eval_nginx_var(
         src_val = re.sub(
             r"\$(\w+)",
             lambda m: _eval_nginx_var(
-                template, m.group(1), norm_path=norm_path, query=query, headers=headers, _seen=seen
+                template,
+                m.group(1),
+                norm_path=norm_path,
+                query=query,
+                headers=headers,
+                raw_target=raw_target,
+                _seen=seen,
             ),
             src_expr,
         )
     else:
         src_val = _eval_nginx_var(
-            template, src_expr, norm_path=norm_path, query=query, headers=headers, _seen=seen
+            template,
+            src_expr,
+            norm_path=norm_path,
+            query=query,
+            headers=headers,
+            raw_target=raw_target,
+            _seen=seen,
         )
     return _eval_nginx_map(rules, src_val)
 
@@ -3706,10 +3967,20 @@ def test_proxy_runtime_error_logs_redacted() -> None:
             assert log_fmt_m, "Missing log_format passport_safe in nginx template"
             fmt_vars = set(re.findall(r"\$[A-Za-z0-9_]+", log_fmt_m.group(1)))
 
-        def _guard_hit(cond: str, norm_path: str, query: str, headers) -> bool:
+        def _guard_hit(cond: str, raw_target: str, norm_path: str, query: str, headers) -> bool:
             var_m = re.fullmatch(r"\$(\w+)", cond)
             if var_m:
-                return _eval_nginx_var(template, var_m.group(1), norm_path=norm_path, query=query, headers=headers) not in ("", "0")
+                return (
+                    _eval_nginx_var(
+                        template,
+                        var_m.group(1),
+                        norm_path=norm_path,
+                        query=query,
+                        headers=headers,
+                        raw_target=raw_target,
+                    )
+                    not in ("", "0")
+                )
             args_m = re.fullmatch(r'\$args\s+~\*\s+"(.*)"', cond)
             if args_m:
                 return bool(re.search(args_m.group(1), query, re.IGNORECASE))
@@ -3729,21 +4000,28 @@ def test_proxy_runtime_error_logs_redacted() -> None:
                 ref_field = "-"
             return f'127.0.0.1 - "{method} {safe_uri} HTTP/1.1" {status} 2 "{ref_field}"'
 
-        def _nginx_access_enabled(norm_path: str, query: str, headers, *, loc_acc_off: bool = False) -> bool:
+        def _nginx_access_enabled(raw_target: str, norm_path: str, query: str, headers, *, loc_acc_off: bool = False) -> bool:
             if loc_acc_off or not site_acc_m or site_acc_m.group(1) == "off":
                 return False
             cond_var = site_acc_m.group(3)
             if cond_var:
                 return (
-                    _eval_nginx_var(template, cond_var, norm_path=norm_path, query=query, headers=headers)
+                    _eval_nginx_var(
+                        template,
+                        cond_var,
+                        norm_path=norm_path,
+                        query=query,
+                        headers=headers,
+                        raw_target=raw_target,
+                    )
                     not in ("", "0")
                 )
             return True
 
         def _emit_nginx_access(
-            requestline: str, method: str, norm_path: str, query: str, status: int, headers, *, loc_acc_off: bool = False
+            requestline: str, raw_target: str, method: str, norm_path: str, query: str, status: int, headers, *, loc_acc_off: bool = False
         ) -> None:
-            if not _nginx_access_enabled(norm_path, query, headers, loc_acc_off=loc_acc_off):
+            if not _nginx_access_enabled(raw_target, norm_path, query, headers, loc_acc_off=loc_acc_off):
                 return
             if access_log_write_fail:
                 if site_err_m and site_err_m.group(1) != "/dev/null":
@@ -3780,28 +4058,34 @@ def test_proxy_runtime_error_logs_redacted() -> None:
                 query = parsed.query
                 if flavor == "nginx":
                     for cond, code in guards:
-                        if _guard_hit(cond, norm_path, query, self.headers):
+                        if _guard_hit(cond, self.path, norm_path, query, self.headers):
                             _emit_nginx_access(
-                                self.requestline, self.command, norm_path, query, code, self.headers, loc_acc_off=False
+                                self.requestline, self.path, self.command, norm_path, query, code, self.headers, loc_acc_off=False
                             )
                             self._reply(code)  # `return` writes nothing to error_log
                             return
                     in_secret_loc = norm_path.startswith("/xiaozhi/ota/d/")
                     err_sink_null = in_secret_loc and ota_d_block_m and "error_log /dev/null emerg;" in ota_d_block_m.group(1)
                     acc_off = bool(in_secret_loc and ota_d_block_m and "access_log off;" in ota_d_block_m.group(1))
+                    if in_secret_loc and not re.match(r"^/xiaozhi/ota/d/[^/]+/?$", norm_path):
+                        _emit_nginx_access(
+                            self.requestline, self.path, self.command, norm_path, query, 404, self.headers, loc_acc_off=acc_off
+                        )
+                        self._reply(404)
+                        return
                     if not _upstream_fails():
                         raise AssertionError("dead upstream port unexpectedly accepted")
                     if not err_sink_null and site_err_m:
                         line = (
                             f"[error] connect() failed (111: Connection refused) while connecting to upstream, "
                             f'client: 127.0.0.1, server: passport, request: "{self.requestline}", '
-                            f'upstream: "http://127.0.0.1:{dead_port}/xiaozhi/ota/", host: "{self.headers.get("Host", "")}"'
+                            f'upstream: "http://127.0.0.1:{dead_port}{self.path}", host: "{self.headers.get("Host", "")}"'
                         )
                         if self.headers.get("Referer"):
                             line += f', referrer: "{self.headers["Referer"]}"'
                         sinks["err"].append(line)
                     _emit_nginx_access(
-                        self.requestline, self.command, norm_path, query, 502, self.headers, loc_acc_off=acc_off
+                        self.requestline, self.path, self.command, norm_path, query, 502, self.headers, loc_acc_off=acc_off
                     )
                     self._reply(502)
                     return
@@ -3867,20 +4151,23 @@ def test_proxy_runtime_error_logs_redacted() -> None:
         threading.Thread(target=srv.serve_forever, daemon=True).start()
         statuses = []
         try:
-            base = f"http://127.0.0.1:{srv.server_address[1]}"
+            port = int(srv.server_address[1])
             for method, path, referer in requests_spec:
-                headers = {"Content-Type": "application/json", "Device-Id": "aa:bb:cc:dd:ee:99"}
+                headers = {
+                    "Connection": "close",
+                    "Content-Type": "application/json",
+                    "Device-Id": "aa:bb:cc:dd:ee:99",
+                }
                 if referer is not None:
                     headers["Referer"] = referer
-                req = urllib.request.Request(
-                    base + path, data=b"{}" if method == "POST" else None, headers=headers, method=method
-                )
+                conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
                 try:
-                    with urllib.request.urlopen(req, timeout=5) as resp:
-                        statuses.append(resp.status)
-                except urllib.error.HTTPError as exc:
-                    exc.read()
-                    statuses.append(exc.code)
+                    conn.request(method, path, body=b"{}" if method == "POST" else None, headers=headers)
+                    resp = conn.getresponse()
+                    resp.read()
+                    statuses.append(resp.status)
+                finally:
+                    conn.close()
         finally:
             srv.shutdown()
             srv.server_close()
@@ -3919,11 +4206,17 @@ def test_proxy_runtime_error_logs_redacted() -> None:
             ("POST", f"/xiaozhi/ota/?token={syn}", secret_ref),
             ("GET", f"/xiaozhi/ota/?%74oken={syn}", secret_ref),
             ("GET", f"/xiaozhi/v1/?from=mqtt_gateway&%74oken={syn}", secret_ref),
+            ("GET", "/xiaozhi/v1/?FROM=MQTT_GATEWAY", secret_ref),
             ("POST", f"/xiaozhi/ota/d/{syn}/?token={syn}", secret_ref),
+            ("GET", f"/xiaozhi/ota/d/{syn}/../../", None),
+            ("GET", f"/xiaozhi/ota/d/{syn}/..", None),
+            ("GET", f"/xiaozhi/ota/d/{syn}/%2e%2e/%2e%2e/", None),
+            ("GET", f"/%78iaozhi/ota/d/{syn}/../../", None),
+            ("GET", f"/xiaozhi/ota/d/{syn}/../", None),
             ("GET", "/xiaozhi/v1/?from=mqtt_gateway", "https://passport.example/"),
         ],
     )
-    assert caddy_status == [502, 502, 400, 400, 400, 400, 502], caddy_status
+    assert caddy_status == [502, 502, 400, 400, 400, 400, 400, 400, 400, 400, 400, 404, 502], caddy_status
     err_sink = [s for s in caddy_sinks if "http.log.error" in s["include"]]
     assert err_sink and len(err_sink[0]["lines"]) == 6, (
         f"Caddy runtime error sink expected 6 entries from the three 502s, got: {len(err_sink[0]['lines']) if err_sink else 0}"
@@ -3941,10 +4234,11 @@ def test_proxy_runtime_error_logs_redacted() -> None:
     _drive("caddy", caddy_no_global, ctrl_sinks, [("POST", f"/xiaozhi/ota/d/{syn}/", None)])
     assert any(syn in line for s in ctrl_sinks for line in s["lines"]), "Caddy negative control failed to detect leak"
 
-    # --- Nginx: site error log and access log across literal & equivalent percent-encoded Referers & query creds ---
+    # --- Nginx: site error log and access log across literal & equivalent percent-encoded Referers, query creds, & traversal paths ---
     guards = _nginx_server_guards(nginx_text)
     assert ("$passport_unsafe_referer", 400) in guards, f"Missing server-level Referer guard: {guards}"
     assert ("$passport_unsafe_query", 400) in guards, f"Missing server-level query guard: {guards}"
+    assert ("$passport_unsafe_path", 400) in guards, f"Missing server-level path guard: {guards}"
     site_err = re.search(r"^    error_log\s+(\S+)\s+(\w+);", nginx_text, re.MULTILINE)
     assert site_err and site_err.group(1) != "/dev/null", "site error_log must remain a real diagnostic log"
     nginx_logs: dict[str, list[str]] = {"err": [], "access": []}
@@ -3970,7 +4264,16 @@ def test_proxy_runtime_error_logs_redacted() -> None:
             ("GET", f"/xiaozhi/ota/?%74oken={syn}", "https://passport.example/"),
             ("GET", f"/xiaozhi/ota/?%54oken={syn}", "https://passport.example/"),
             ("GET", f"/xiaozhi/v1/?from=mqtt_gateway&%74oken={syn}", "https://passport.example/"),
+            ("GET", "/xiaozhi/v1/?FROM=MQTT_GATEWAY", "https://passport.example/"),
             ("GET", f"/xiaozhi/ota/?probe={syn}", "https://passport.example/"),
+            ("GET", f"/xiaozhi/ota/d/{syn}/../../", None),
+            ("GET", f"/xiaozhi/ota/d/{syn}/../..", None),
+            ("GET", f"/xiaozhi/ota/d/{syn}/%2e%2e/%2e%2e/", None),
+            ("GET", f"/xiaozhi/ota/d/{syn}/%2e%2e/%2e%2e", None),
+            ("GET", f"/%78iaozhi/ota/d/{syn}/../../", None),
+            ("GET", f"/xiaozhi/ota/d/{syn}/../../../", None),
+            ("GET", f"/xiaozhi/ota/d/{syn}/../../../../xiaozhi/v1/", None),
+            ("GET", f"/xiaozhi/ota/d/{syn}/../", None),
             ("POST", "/xiaozhi/ota/", "https://passport.example/"),
             ("POST", f"/xiaozhi/ota/d/{syn}/", None),
             ("POST", f"/%78iaozhi/%6fta/%64/{syn}/", None),
@@ -3978,7 +4281,7 @@ def test_proxy_runtime_error_logs_redacted() -> None:
             ("GET", "/xiaozhi/v1/?from=mqtt_gateway", "https://passport.example/"),
         ],
     )
-    assert nginx_status == [400] * 18 + [502, 502, 502, 400, 502], nginx_status
+    assert nginx_status == [400] * 26 + [404, 502, 502, 502, 400, 502], nginx_status
     assert len(nginx_logs["err"]) == 2 and all('referrer: "https://passport.example/"' in ln for ln in nginx_logs["err"]), (
         f"nginx stand-in error_log unexpected: {nginx_logs['err']}"
     )
@@ -3990,8 +4293,8 @@ def test_proxy_runtime_error_logs_redacted() -> None:
     )
 
     # Access-log write failure simulation: unsafe-Referer 400s, disallowed/encoded-query 400s,
-    # and server-level secret-URI query rejections all skip access_log, so neither error_log `[alert]`
-    # nor access_log captures raw Referer, raw query secret, or secret URI.
+    # traversal-path 400s, single-dot 404 negative controls, and server-level secret-URI query
+    # rejections all skip access_log, so neither error_log `[alert]` nor access_log captures leaks.
     fail_logs: dict[str, list[str]] = {"err": [], "access": []}
     fail_status = _drive(
         "nginx",
@@ -4020,12 +4323,18 @@ def test_proxy_runtime_error_logs_redacted() -> None:
             ("GET", f"/xiaozhi/ota/?%74oken={syn}", "https://passport.example/"),
             ("GET", f"/xiaozhi/ota/?%54oken={syn}", "https://passport.example/"),
             ("GET", f"/xiaozhi/v1/?from=mqtt_gateway&%74oken={syn}", "https://passport.example/"),
+            ("GET", "/xiaozhi/v1/?FROM=MQTT_GATEWAY", "https://passport.example/"),
             ("GET", f"/xiaozhi/ota/?probe={syn}", "https://passport.example/"),
+            ("GET", f"/xiaozhi/ota/d/{syn}/../../", None),
+            ("GET", f"/xiaozhi/ota/d/{syn}/../..", None),
+            ("GET", f"/xiaozhi/ota/d/{syn}/%2e%2e/%2e%2e/", None),
+            ("GET", f"/%78iaozhi/ota/d/{syn}/../../", None),
+            ("GET", f"/xiaozhi/ota/d/{syn}/../", None),
             ("GET", "/xiaozhi/v1/?from=mqtt_gateway", "https://passport.example/"),
         ],
         access_log_write_fail=True,
     )
-    assert fail_status == [400] * 14 + [502, 502, 502, 400, 400, 400, 400, 400, 400, 502], fail_status
+    assert fail_status == [400] * 14 + [502, 502, 502] + [400] * 11 + [404, 502], fail_status
     assert fail_logs["access"] == []
     assert len(fail_logs["err"]) == 4 and all('referrer: "https://passport.example/"' in ln for ln in fail_logs["err"]), (
         f"unexpected fail_logs err: {fail_logs['err']}"
@@ -4129,9 +4438,39 @@ def test_proxy_runtime_error_logs_redacted() -> None:
     assert len(legacy_q_logs["err"]) == 2
     assert any("connect() failed" in ln and syn in ln for ln in legacy_q_logs["err"])
     assert any("[alert]" in ln and syn in ln for ln in legacy_q_logs["err"])
+
+    # Negative control 5: stripping `$passport_unsafe_path` guard & its `$passport_log_access` term lets
+    # `/xiaozhi/ota/d/<syn>/../../` reach ordinary `/xiaozhi/ota/` (502) and leak `<syn>` into BOTH
+    # `connect() failed` AND `[alert]`.
+    nginx_no_path_guard = re.sub(
+        r"\n\s*if \(\$passport_unsafe_path\) \{\s*return 400;\s*\}", "", nginx_text, count=1
+    )
+    nginx_no_path_guard = re.sub(
+        r'map "\$passport_unsafe_referer:\$passport_unsafe_query:\$passport_unsafe_path:\$passport_secret_ota_uri" \$passport_log_access \{.*?\}',
+        'map "$passport_unsafe_referer:$passport_unsafe_query:$passport_secret_ota_uri" $passport_log_access {\n'
+        '    "0:0:0"  1;\n'
+        '    default  0;\n'
+        '}',
+        nginx_no_path_guard,
+        count=1,
+        flags=re.DOTALL,
+    )
+    assert nginx_no_path_guard != nginx_text
+    no_path_logs: dict[str, list[str]] = {"err": [], "access": []}
+    no_path_status = _drive(
+        "nginx",
+        nginx_no_path_guard,
+        no_path_logs,
+        [("GET", f"/xiaozhi/ota/d/{syn}/../../", None)],
+        access_log_write_fail=True,
+    )
+    assert no_path_status == [502], f"Negative control 5 failed to pass two-dot traversal: {no_path_status}"
+    assert len(no_path_logs["err"]) == 2
+    assert any("connect() failed" in ln and syn in ln for ln in no_path_logs["err"])
+    assert any("[alert]" in ln and syn in ln for ln in no_path_logs["err"])
     print(
-        "[PASS] round-2/3/4: Caddy/Nginx template-driven stand-ins record zero OTA secrets across "
-        "literal & letter-percent-encoded equivalents and simulated access_log write failures"
+        "[PASS] round-2/3/4/5: Caddy/Nginx template-driven stand-ins record zero OTA secrets across "
+        "literal, letter-percent-encoded, two-dot traversal, and simulated access_log write failures"
     )
 
 
@@ -4273,11 +4612,13 @@ def test_real_nginx_log_isolation(ota_base: str, dev_a: dict) -> set[str]:
                     "    ~*(^|&)(authorization|token|access_token|refresh_token|id_token|secret|ota_secret|key|api_key|apikey|password|sig|signature|auth)= 1;\n"
                     "    default 0;\n"
                     "}\n"
-                    "map \"$passport_unsafe_referer:$passport_legacy_cred_query:$uri\" $passport_legacy_log_access {\n"
-                    "    ~^1:                         0;\n"
-                    "    ~^0:1:                       0;\n"
-                    "    ~(?i)^0:0:/xiaozhi/+ota/+d/  0;\n"
-                    "    default                      1;\n"
+                    "map \"$passport_unsafe_referer:$passport_legacy_cred_query:$passport_unsafe_path:$passport_secret_ota_uri\" $passport_legacy_log_access {\n"
+                    "    \"0:0:0:0\"  1;\n"
+                    "    default    0;\n"
+                    "}\n"
+                    "map \"$passport_unsafe_referer:$passport_unsafe_query:$passport_secret_ota_uri\" $passport_legacy_no_path_log_access {\n"
+                    "    \"0:0:0\"  1;\n"
+                    "    default  0;\n"
                     "}\n"
                 )
                 # Separate server{} blocks give each probe an isolated ngx_http_log_t (bypassing Nginx's 60s error_log_time throttle).
@@ -4309,6 +4650,15 @@ def test_real_nginx_log_isolation(ota_base: str, dev_a: dict) -> set[str]:
                     ("fixed_ota_q_noref", "GET", f"/xiaozhi/ota/?api_key={q_syn}", None, 400, "fixed"),
                     ("fixed_ws_q_ref", "GET", f"/xiaozhi/v1/?foo=1&Authorization={q_syn}", "https://passport.example/", 400, "fixed"),
                     ("fixed_ws_enc_q_ref", "GET", f"/xiaozhi/v1/?from=mqtt_gateway&%74oken={q_syn}", "https://passport.example/", 400, "fixed"),
+                    ("fixed_v1_upper_q", "GET", "/xiaozhi/v1/?FROM=MQTT_GATEWAY", "https://passport.example/", 400, "fixed"),
+                    ("fixed_twodot_slash", "GET", f"/xiaozhi/ota/d/{syn}/../../", None, 400, "fixed"),
+                    ("fixed_twodot_noslash", "GET", f"/xiaozhi/ota/d/{syn}/../..", None, 400, "fixed"),
+                    ("fixed_twodot_pct", "GET", f"/xiaozhi/ota/d/{syn}/%2e%2e/%2e%2e/", None, 400, "fixed"),
+                    ("fixed_twodot_pct_nosl", "GET", f"/xiaozhi/ota/d/{syn}/%2e%2e/%2e%2e", None, 400, "fixed"),
+                    ("fixed_twodot_enc_pfx", "GET", f"/%78iaozhi/ota/d/{syn}/../../", None, 400, "fixed"),
+                    ("fixed_twodot_full_enc", "GET", f"/%78%69%61%6f%7a%68%69/%6f%74%61/%64/{syn}/../../", None, 400, "fixed"),
+                    ("fixed_threedot_root", "GET", f"/xiaozhi/ota/d/{syn}/../../../", None, 400, "fixed"),
+                    ("fixed_onedot_ctrl", "GET", f"/xiaozhi/ota/d/{syn}/../", None, 404, "fixed"),
                     ("fixed_safe_pos", "GET", "/xiaozhi/ota/", "https://passport.example/", 200, "fixed_pos"),
                     ("fixed_ws_mqtt_pos", "GET", "/xiaozhi/v1/?from=mqtt_gateway", "https://passport.example/", 200, "fixed_pos"),
                     ("neg_uncond_lit", "POST", "/xiaozhi/ota/", f"https://passport.example/xiaozhi/ota/d/{syn}/", 400, "neg_uncond"),
@@ -4316,16 +4666,18 @@ def test_real_nginx_log_isolation(ota_base: str, dev_a: dict) -> set[str]:
                     ("neg_uncond_ota_q", "POST", f"/xiaozhi/ota/?token={q_syn}", "https://passport.example/", 400, "neg_uncond"),
                     ("neg_uncond_enc_q", "GET", f"/xiaozhi/ota/?%74oken={q_syn}", "https://passport.example/", 400, "neg_uncond"),
                     ("neg_legacy_raw_q", "GET", f"/xiaozhi/ota/?%74oken={q_syn}", "https://passport.example/", 502, "neg_legacy_raw_q"),
+                    ("neg_legacy_path_twodot", "GET", f"/xiaozhi/ota/d/{syn}/../../", None, 502, "neg_legacy_path_twodot"),
                 ]
                 for label, method, path, ref, exp_code, mode_tag in full_cases:
                     fp = _free_port()
                     ferr = tmp / f"full_{label}.log"
                     full_specs.append((label, fp, ferr, method, path, ref, exp_code, mode_tag))
+                    use_dead = mode_tag in ("neg_legacy_raw_q", "neg_legacy_path_twodot")
                     rendered_srv = _render_loopback_nginx_server(
                         srv_tpl,
                         listen_port=fp,
-                        http_upstream_port=dead_port if mode_tag == "neg_legacy_raw_q" else live_http_port,
-                        ws_upstream_port=dead_port if mode_tag == "neg_legacy_raw_q" else cnt_port,
+                        http_upstream_port=dead_port if use_dead else live_http_port,
+                        ws_upstream_port=dead_port if use_dead else cnt_port,
                         access_log_path="/dev/full",
                         error_log_path=str(ferr),
                         strip_access_if=(mode_tag == "neg_uncond"),
@@ -4333,6 +4685,14 @@ def test_real_nginx_log_isolation(ota_base: str, dev_a: dict) -> set[str]:
                     if mode_tag == "neg_legacy_raw_q":
                         rendered_srv = rendered_srv.replace("$passport_unsafe_query", "$passport_legacy_cred_query")
                         rendered_srv = rendered_srv.replace("$passport_log_access", "$passport_legacy_log_access")
+                    elif mode_tag == "neg_legacy_path_twodot":
+                        rendered_srv = re.sub(
+                            r"\n\s*if \(\$passport_unsafe_path\) \{\s*return 400;\s*\}",
+                            "",
+                            rendered_srv,
+                            count=1,
+                        )
+                        rendered_srv = rendered_srv.replace("$passport_log_access", "$passport_legacy_no_path_log_access")
                     servers.append(rendered_srv)
 
             conf = tmp / "nginx.conf"
@@ -4376,8 +4736,9 @@ def test_real_nginx_log_isolation(ota_base: str, dev_a: dict) -> set[str]:
                         time.sleep(0.05)
 
                 # Scenario 0 (counting upstream): verify zero upstream hits for all rejected literal,
-                # percent-encoded, smuggled, and non-allowlisted queries & unsafe Referers, plus exact
-                # upstream hits and header scrubbing for permitted requests.
+                # percent-encoded, smuggled, and non-allowlisted queries, unsafe Referers, and
+                # >=2 dot-segment / encoded OTA path traversals (+ single-dot 404 negative controls),
+                # plus exact upstream hits and header scrubbing for permitted requests.
                 for method, bad_path, bad_hdrs in (
                     ("GET", f"/xiaozhi/ota/?token={q_syn}", {"Referer": "https://passport.example/"}),
                     ("GET", f"/xiaozhi/ota/?%74oken={q_syn}", {"Referer": "https://passport.example/"}),
@@ -4386,12 +4747,25 @@ def test_real_nginx_log_isolation(ota_base: str, dev_a: dict) -> set[str]:
                     ("POST", f"/xiaozhi/ota/?%61pi_key={q_syn}", {"Content-Type": "application/json", "Referer": "https://passport.example/"}),
                     ("GET", f"/xiaozhi/v1/?from=mqtt_gateway&%74oken={q_syn}", {"Referer": "https://passport.example/"}),
                     ("GET", "/xiaozhi/v1/?%66rom=mqtt_gateway", {"Referer": "https://passport.example/"}),
+                    ("GET", "/xiaozhi/v1/?FROM=MQTT_GATEWAY", {"Referer": "https://passport.example/"}),
                     ("POST", f"/mcp/vision/explain?%73ecret={q_syn}", {"Content-Type": "application/json", "Referer": "https://passport.example/"}),
                     ("GET", f"/xiaozhi/ota/?|token={q_syn}", {"Referer": "https://passport.example/"}),
                     ("GET", f"/xiaozhi/ota/?probe={benign_q}", {"Referer": "https://passport.example/"}),
                     ("GET", "/xiaozhi/ota/?from=mqtt_gateway", {"Referer": "https://passport.example/"}),
                     ("POST", f"/xiaozhi/ota/d/{syn}/?%74oken={q_syn}", {"Content-Type": "application/json"}),
                     ("GET", "/xiaozhi/ota/", {"Referer": f"https://passport.example/%78iaozhi/%6fta/%64/{syn}/"}),
+                    ("GET", f"/xiaozhi/ota/d/{syn}/../../", {}),
+                    ("GET", f"/xiaozhi/ota/d/{syn}/../..", {}),
+                    ("GET", f"/xiaozhi/ota/d/{syn}/%2e%2e/%2e%2e/", {}),
+                    ("GET", f"/xiaozhi/ota/d/{syn}/%2e%2e/%2e%2e", {}),
+                    ("GET", f"/%78iaozhi/ota/d/{syn}/../../", {}),
+                    ("GET", f"/%78%69%61%6f%7a%68%69/%6f%74%61/%64/{syn}/../../", {}),
+                    ("GET", f"/xiaozhi/ota/d/{syn}/..%2f../", {}),
+                    ("GET", f"/%58iaozhi/%4fta/%44/{syn}/../../", {}),
+                    ("GET", f"/xiaozhi/ota/d/{syn}/../../../", {}),
+                    ("GET", f"/xiaozhi/ota/d/{syn}/../../../../xiaozhi/v1/", {}),
+                    ("POST", f"/xiaozhi/ota/d/{syn}/../../../../mcp/vision/explain", {"Content-Type": "application/json"}),
+                    ("GET", f"/xiaozhi/ota/d/{syn}/../../download/fw_1.0.bin", {}),
                 ):
                     st_cnt_bad, _ = _raw_http(
                         p_count,
@@ -4401,8 +4775,16 @@ def test_real_nginx_log_isolation(ota_base: str, dev_a: dict) -> set[str]:
                         body=b"{}" if method == "POST" else None,
                     )
                     assert st_cnt_bad == 400, f"Counting nginx failed to reject {method} {bad_path}: {st_cnt_bad}"
+                for onedot_ctrl in (
+                    f"/xiaozhi/ota/d/{syn}/../",
+                    f"/xiaozhi/ota/d/{syn}/..",
+                    f"/xiaozhi/ota/d/{syn}/%2e%2e/",
+                    f"/%78iaozhi/ota/d/{syn}/../",
+                ):
+                    st_cnt_404, _ = _raw_http(p_count, "GET", onedot_ctrl)
+                    assert st_cnt_404 == 404, f"Counting nginx single-dot negative control {onedot_ctrl} returned {st_cnt_404}"
                 with cnt_lock:
-                    assert cnt_hits == [], f"Rejected requests reached real nginx counting upstream: {cnt_hits}"
+                    assert cnt_hits == [], f"Rejected/404 requests reached real nginx counting upstream: {cnt_hits}"
 
                 st_cnt_ota, _ = _raw_http(
                     p_count, "GET", "/xiaozhi/ota/", headers={"Referer": "https://passport.example/"}
@@ -4412,6 +4794,10 @@ def test_real_nginx_log_isolation(ota_base: str, dev_a: dict) -> set[str]:
                     p_count, "GET", "/xiaozhi/v1/?from=mqtt_gateway", headers={"Referer": "https://passport.example/"}
                 )
                 assert st_cnt_ws == 200, st_cnt_ws
+                st_cnt_dl, _ = _raw_http(
+                    p_count, "GET", "/xiaozhi/ota/download/fw_1.0.bin", headers={"Referer": "https://passport.example/"}
+                )
+                assert st_cnt_dl == 200, st_cnt_dl
                 st_cnt_sec, _ = _raw_http(
                     p_count,
                     "POST",
@@ -4426,13 +4812,14 @@ def test_real_nginx_log_isolation(ota_base: str, dev_a: dict) -> set[str]:
                 )
                 assert st_cnt_sec == 200, st_cnt_sec
                 with cnt_lock:
-                    assert len(cnt_hits) == 3, f"Expected 3 forwarded hits on counting upstream, got {len(cnt_hits)}"
+                    assert len(cnt_hits) == 4, f"Expected 4 forwarded hits on counting upstream, got {len(cnt_hits)}"
                     assert cnt_hits[0]["path"] == "/xiaozhi/ota/"
                     assert cnt_hits[1]["path"] == "/xiaozhi/v1/?from=mqtt_gateway"
-                    assert cnt_hits[2]["path"] == "/xiaozhi/ota/"
-                    assert cnt_hits[2]["headers"].get("x-ota-secret") == syn
+                    assert cnt_hits[2]["path"] == "/xiaozhi/ota/download/fw_1.0.bin"
+                    assert cnt_hits[3]["path"] == "/xiaozhi/ota/"
+                    assert cnt_hits[3]["headers"].get("x-ota-secret") == syn
                     for scrubbed in ("authorization", "x-original-uri", "referer"):
-                        assert scrubbed not in cnt_hits[2]["headers"], f"Counting upstream still saw {scrubbed}"
+                        assert scrubbed not in cnt_hits[3]["headers"], f"Counting upstream still saw {scrubbed}"
                     cnt_hits.clear()
 
                 # Scenario 1: Normal rejection & live OTA forwarding.
@@ -4530,7 +4917,16 @@ def test_real_nginx_log_isolation(ota_base: str, dev_a: dict) -> set[str]:
                     ("GET", f"/xiaozhi/ota/?%74oken={q_syn}"),
                     ("GET", f"/xiaozhi/ota/?%54oken={q_syn}"),
                     ("GET", f"/xiaozhi/v1/?from=mqtt_gateway&%74oken={q_syn}"),
+                    ("GET", "/xiaozhi/v1/?FROM=MQTT_GATEWAY"),
                     ("POST", f"/xiaozhi/ota/d/{syn}/?%74oken={q_syn}"),
+                    ("GET", f"/xiaozhi/ota/d/{syn}/../../"),
+                    ("GET", f"/xiaozhi/ota/d/{syn}/../.."),
+                    ("GET", f"/xiaozhi/ota/d/{syn}/%2e%2e/%2e%2e/"),
+                    ("GET", f"/xiaozhi/ota/d/{syn}/%2e%2e/%2e%2e"),
+                    ("GET", f"/%78iaozhi/ota/d/{syn}/../../"),
+                    ("GET", f"/%78%69%61%6f%7a%68%69/%6f%74%61/%64/{syn}/../../"),
+                    ("GET", f"/xiaozhi/ota/d/{syn}/../../../"),
+                    ("GET", f"/xiaozhi/ota/d/{syn}/../../../../xiaozhi/v1/"),
                 ):
                     st_d_q, _ = _raw_http(
                         p_dead,
@@ -4540,6 +4936,9 @@ def test_real_nginx_log_isolation(ota_base: str, dev_a: dict) -> set[str]:
                         body=b"{}" if bad_dead_method == "POST" else None,
                     )
                     assert st_d_q == 400, (bad_dead_method, bad_dead_path, st_d_q)
+                for onedot_dead in (f"/xiaozhi/ota/d/{syn}/../", f"/xiaozhi/ota/d/{syn}/.."):
+                    st_d_404, _ = _raw_http(p_dead, "GET", onedot_dead)
+                    assert st_d_404 == 404, (onedot_dead, st_d_404)
                 st_502_safe, _ = _raw_http(
                     p_dead,
                     "POST",
@@ -4560,7 +4959,7 @@ def test_real_nginx_log_isolation(ota_base: str, dev_a: dict) -> set[str]:
                     st_f, _ = _raw_http(fp, method, path, headers=hdrs, body=b"{}" if method == "POST" else None)
                     assert st_f == exp_code, f"/dev/full case {label} returned {st_f}, expected {exp_code}"
 
-                _wait_for_log_substring([cnt_acc], "/xiaozhi/v1/?[REDACTED]")
+                _wait_for_log_substring([cnt_acc], "/xiaozhi/ota/download/fw_1.0.bin")
                 _wait_for_log_substring([dead_err], "connect() failed")
                 _wait_for_log_substring([live_acc], "/xiaozhi/v1/?[REDACTED]")
                 if full_specs:
@@ -4572,6 +4971,8 @@ def test_real_nginx_log_isolation(ota_base: str, dev_a: dict) -> set[str]:
                     _wait_for_log_substring([tmp / "full_neg_uncond_enc_q.log"], "[alert]")
                     _wait_for_log_substring([tmp / "full_neg_legacy_raw_q.log"], "[alert]")
                     _wait_for_log_substring([tmp / "full_neg_legacy_raw_q.log"], "connect() failed")
+                    _wait_for_log_substring([tmp / "full_neg_legacy_path_twodot.log"], "[alert]")
+                    _wait_for_log_substring([tmp / "full_neg_legacy_path_twodot.log"], "connect() failed")
                 time.sleep(0.15)
 
                 cnt_acc_lines = [ln for ln in cnt_acc.read_text(encoding="utf-8", errors="replace").splitlines() if ln.strip()]
@@ -4582,9 +4983,10 @@ def test_real_nginx_log_isolation(ota_base: str, dev_a: dict) -> set[str]:
                 dead_err_txt = dead_err.read_text(encoding="utf-8", errors="replace")
                 global_err_txt = global_err.read_text(encoding="utf-8", errors="replace")
 
-                assert len(cnt_acc_lines) == 2, f"Unexpected real nginx cnt_access.log lines: {cnt_acc_lines}"
+                assert len(cnt_acc_lines) == 3, f"Unexpected real nginx cnt_access.log lines: {cnt_acc_lines}"
                 assert '"GET /xiaozhi/ota/ HTTP/1.1" 200' in cnt_acc_lines[0]
                 assert '"GET /xiaozhi/v1/?[REDACTED] HTTP/1.1" 200' in cnt_acc_lines[1]
+                assert '"GET /xiaozhi/ota/download/fw_1.0.bin HTTP/1.1" 200' in cnt_acc_lines[2]
                 assert cnt_err_txt == "", f"Expected empty cnt_error.log, got: {redact_text(cnt_err_txt)}"
 
                 assert len(live_acc_lines) == 2, f"Unexpected real nginx live_access.log lines: {live_acc_lines}"
@@ -4625,10 +5027,14 @@ def test_real_nginx_log_isolation(ota_base: str, dev_a: dict) -> set[str]:
                         assert "[alert]" in ftxt and 'write() to "/dev/full" failed' in ftxt and expected_leak in ftxt, (
                             f"Real nginx negative control {label} failed to reproduce [alert] leak"
                         )
-                    else:
-                        assert mode_tag == "neg_legacy_raw_q"
+                    elif mode_tag == "neg_legacy_raw_q":
                         assert "connect() failed" in ftxt and "[alert]" in ftxt and ftxt.count(q_syn) >= 2, (
                             f"Real nginx legacy-query negative control failed to leak in both connect() and [alert]: {ftxt!r}"
+                        )
+                    else:
+                        assert mode_tag == "neg_legacy_path_twodot"
+                        assert "connect() failed" in ftxt and "[alert]" in ftxt and ftxt.count(syn) >= 2, (
+                            f"Real nginx legacy-path two-dot negative control failed to leak in both connect() and [alert]: {ftxt!r}"
                         )
 
                 forbidden_all = {syn, q_syn, benign_q, dev_a["ota_secret"], *issued_tokens}
@@ -4762,8 +5168,20 @@ def test_real_caddy_adapt_and_routing(ota_base: str, dev_a: dict) -> set[str]:
                 live_base = f"http://127.0.0.1:{live_port}"
                 dead_base = f"http://127.0.0.1:{dead_proxy_port}"
 
-                # 1. All literal, uppercase, percent-encoded credential queries & unexpected queries
-                #    must be rejected at the proxy with 400 and ZERO hits on both counting upstreams.
+                def _caddy_raw_http(port: int, method: str, path: str, *, headers: Optional[dict[str, str]] = None, body: Optional[bytes] = None) -> int:
+                    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+                    try:
+                        hdrs = {"Connection": "close", **(headers or {})}
+                        conn.request(method, path, body=body, headers=hdrs)
+                        resp = conn.getresponse()
+                        resp.read()
+                        return resp.status
+                    finally:
+                        conn.close()
+
+                # 1. All literal, uppercase, percent-encoded credential queries, unexpected queries,
+                #    and non-canonical OTA traversal paths must be rejected at the proxy (400 / 404)
+                #    with ZERO hits on both counting upstreams.
                 for qk in sorted(SENSITIVE_QUERY_KEYS):
                     enc_l = f"%{ord(qk[0].lower()):02x}{qk[1:]}"
                     enc_u = f"%{ord(qk[0].upper()):02X}{qk[1:]}"
@@ -4791,12 +5209,43 @@ def test_real_caddy_adapt_and_routing(ota_base: str, dev_a: dict) -> set[str]:
                     f"/xiaozhi/ota/?probe={benign_q}",
                     "/xiaozhi/ota/?from=mqtt_gateway",
                     "/xiaozhi/v1/?%66rom=mqtt_gateway",
+                    "/xiaozhi/v1/?FROM=MQTT_GATEWAY",
                 ):
                     try:
                         with urllib.request.urlopen(f"{live_base}{bad_get}", timeout=5):
                             raise AssertionError(f"Expected 400 on real caddy GET {bad_get}")
                     except urllib.error.HTTPError as exc:
                         assert exc.code == 400, f"Real caddy returned {exc.code} for GET {bad_get}"
+                for raw_method, raw_trav in (
+                    ("GET", f"/xiaozhi/ota/d/{syn}/.."),
+                    ("GET", f"/xiaozhi/ota/d/{syn}/../../"),
+                    ("GET", f"/xiaozhi/ota/d/{syn}/../.."),
+                    ("GET", f"/xiaozhi/ota/d/{syn}/%2e%2e/%2e%2e/"),
+                    ("GET", f"/xiaozhi/ota/d/{syn}/%2e%2e/%2e%2e"),
+                    ("GET", f"/%78iaozhi/ota/d/{syn}/../../"),
+                    ("GET", f"/%78%69%61%6f%7a%68%69/%6f%74%61/%64/{syn}/../../"),
+                    ("GET", f"/xiaozhi/ota/d/{syn}/..%2f../"),
+                    ("GET", f"/%58iaozhi/%4fta/%44/{syn}/../../"),
+                    ("GET", f"/xiaozhi/ota/d/{syn}/../../../"),
+                    ("GET", f"/xiaozhi/ota/d/{syn}/../../../../xiaozhi/v1/"),
+                    ("POST", f"/xiaozhi/ota/d/{syn}/../../../../mcp/vision/explain"),
+                    ("GET", f"/xiaozhi/ota/d/{syn}/../../download/fw_1.0.bin"),
+                ):
+                    st_trav = _caddy_raw_http(
+                        live_port,
+                        raw_method,
+                        raw_trav,
+                        headers={"Content-Type": "application/json"} if raw_method == "POST" else None,
+                        body=b"{}" if raw_method == "POST" else None,
+                    )
+                    assert st_trav == 400, f"Real caddy failed to reject traversal {raw_method} {raw_trav}: {st_trav}"
+                for raw_onedot in (
+                    f"/xiaozhi/ota/d/{syn}/../",
+                    f"/xiaozhi/ota/d/{syn}/%2e%2e/",
+                    f"/%78iaozhi/ota/d/{syn}/../",
+                ):
+                    st_404 = _caddy_raw_http(live_port, "GET", raw_onedot)
+                    assert st_404 == 404, f"Real caddy single-dot negative control {raw_onedot} returned {st_404}"
                 with cnt_http_lock:
                     assert cnt_http_hits == [], f"Rejected requests hit Caddy HTTP counting upstream: {cnt_http_hits}"
                 with cnt_ws_lock:
@@ -4805,6 +5254,8 @@ def test_real_caddy_adapt_and_routing(ota_base: str, dev_a: dict) -> set[str]:
                 # 2. Normal permitted requests must actually forward to the counting upstreams.
                 with urllib.request.urlopen(f"{live_base}/xiaozhi/ota/", timeout=5) as r_ok_ota:
                     assert r_ok_ota.status == 200
+                with urllib.request.urlopen(f"{live_base}/xiaozhi/ota/download/fw_1.0.bin", timeout=5) as r_ok_dl:
+                    assert r_ok_dl.status == 200
                 st_sec, _ = post_json(
                     f"{live_base}/xiaozhi/ota/d/{syn}/",
                     {
@@ -4827,23 +5278,32 @@ def test_real_caddy_adapt_and_routing(ota_base: str, dev_a: dict) -> set[str]:
                     assert r_ok_ws.status == 200
 
                 with cnt_http_lock:
-                    assert len(cnt_http_hits) == 3, f"Expected 3 HTTP upstream hits, got {cnt_http_hits}"
+                    assert len(cnt_http_hits) == 4, f"Expected 4 HTTP upstream hits, got {cnt_http_hits}"
                     assert cnt_http_hits[0]["path"] == "/xiaozhi/ota/"
-                    assert cnt_http_hits[1]["path"] == "/xiaozhi/ota/"
-                    assert cnt_http_hits[1]["headers"].get("x-ota-secret") == syn
-                    for scrubbed in ("authorization", "x-original-uri", "referer"):
-                        assert scrubbed not in cnt_http_hits[1]["headers"], f"Caddy leaked {scrubbed} upstream"
+                    assert cnt_http_hits[1]["path"] == "/xiaozhi/ota/download/fw_1.0.bin"
                     assert cnt_http_hits[2]["path"] == "/xiaozhi/ota/"
                     assert cnt_http_hits[2]["headers"].get("x-ota-secret") == syn
+                    for scrubbed in ("authorization", "x-original-uri", "referer"):
+                        assert scrubbed not in cnt_http_hits[2]["headers"], f"Caddy leaked {scrubbed} upstream"
+                    assert cnt_http_hits[3]["path"] == "/xiaozhi/ota/"
+                    assert cnt_http_hits[3]["headers"].get("x-ota-secret") == syn
                 with cnt_ws_lock:
                     assert len(cnt_ws_hits) == 1 and cnt_ws_hits[0]["path"] == "/xiaozhi/v1/?from=mqtt_gateway"
 
-                # 3. Dead upstream site: disallowed query returns 400 (no 502), while valid requests trigger real 502.
+                # 3. Dead upstream site: disallowed query & traversal paths return 400 (no 502),
+                #    single-dot returns 404, while valid requests trigger real 502.
                 try:
                     with urllib.request.urlopen(f"{dead_base}/xiaozhi/ota/?%74oken={q_syn}", timeout=5):
                         raise AssertionError("Expected 400 on dead Caddy site ?%74oken")
                 except urllib.error.HTTPError as exc:
                     assert exc.code == 400
+                for dead_trav in (
+                    f"/xiaozhi/ota/d/{syn}/../../",
+                    f"/xiaozhi/ota/d/{syn}/..",
+                    f"/%78iaozhi/ota/d/{syn}/../../",
+                ):
+                    assert _caddy_raw_http(dead_proxy_port, "GET", dead_trav) == 400, dead_trav
+                assert _caddy_raw_http(dead_proxy_port, "GET", f"/xiaozhi/ota/d/{syn}/../") == 404
                 st_502_sec, _ = post_json(
                     f"{dead_base}/xiaozhi/ota/d/{syn}/",
                     {
@@ -4902,8 +5362,8 @@ def test_real_caddy_adapt_and_routing(ota_base: str, dev_a: dict) -> set[str]:
             live_acc_records = [
                 json.loads(ln) for ln in live_acc_log.read_text(encoding="utf-8").splitlines() if ln.strip()
             ]
-            assert len(live_acc_records) == 2, (
-                f"Expected 2 redacted live access records (OTA/d & 400 skipped), got {len(live_acc_records)}"
+            assert len(live_acc_records) == 3, (
+                f"Expected 3 redacted live access records (OTA/d & 400 skipped), got {len(live_acc_records)}"
             )
             for rec in live_acc_records:
                 assert rec["request"]["uri"] == "[REDACTED]"
@@ -5088,6 +5548,253 @@ asyncio.run(main())
     print("[PASS] non-blocker #6: memory WAV skips disk I/O and slow disk archiving does not block event loop")
 
 
+def test_auto_realtime_asr_cancel_unit(server_home: Path) -> None:
+    """Verify auto/realtime VAD ASR shares connection-scoped task dispatch, abort/close cancel, and barge-in safety."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp = Path(tmpdir)
+        srv_home = _make_srv_home(server_home, tmp / "asr_cancel_srv_home")
+        devices_file = tmp / "devices.yaml"
+        auth_file = tmp / "auth_key"
+        subprocess.run(
+            [
+                sys.executable,
+                str(ROOT / "scripts" / "provision_device.py"),
+                "add",
+                "--devices-file",
+                str(devices_file),
+                "--device-id",
+                "aa:bb:cc:dd:ee:77",
+                "--client-id",
+                "asr-cancel-client",
+                "--json",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        subprocess.run(
+            [sys.executable, str(ROOT / "scripts" / "write_config.py")],
+            env=_base_env(
+                XIAOZHI_HOME=str(srv_home),
+                PASSPORT_MODE="demo",
+                PASSPORT_AUTH_FILE=str(auth_file),
+                PASSPORT_DEVICES_FILE=str(devices_file),
+                PASSPORT_LOG_DIR=str(srv_home / "tmp"),
+                PASSPORT_FAKE_BASE="http://127.0.0.1:18019",
+            ),
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
+        probe_code = """
+import asyncio, os, sys, time
+
+os.chdir(os.environ["XIAOZHI_HOME"])
+for p in (os.environ["PASSPORT_ROOT"], os.environ["XIAOZHI_HOME"]):
+    if p not in sys.path:
+        sys.path.insert(0, p)
+
+from config.config_loader import load_config
+import core.handle.abortHandle as abort_handle
+import core.handle.receiveAudioHandle as receive_audio_handle
+import core.handle.reportHandle as report_handle
+
+events_log = []
+
+def spy_enqueue_asr_report(conn, text, opus_data):
+    events_log.append(("enqueue", conn.client_listen_mode, text))
+
+async def spy_start_to_chat(conn, text):
+    if conn.client_is_speaking and conn.client_listen_mode != "manual":
+        await abort_handle.handleAbortMessage(conn)
+    events_log.append(("chat", conn.client_listen_mode, text))
+
+receive_audio_handle.startToChat = spy_start_to_chat
+report_handle.enqueue_asr_report = spy_enqueue_asr_report
+
+from passport_server.patches import apply_all_patches
+apply_all_patches()
+
+from core.connection import ConnectionHandler
+from core.providers.asr.base import ASRProviderBase
+from core.providers.asr.dto.dto import InterfaceType
+
+class FakeWS:
+    def __init__(self):
+        self.closed = False
+        self.sent = []
+    async def send(self, msg):
+        self.sent.append(msg)
+    async def close(self):
+        self.closed = True
+
+class ControllableASR(ASRProviderBase):
+    def __init__(self, output_dir):
+        super().__init__()
+        self.interface_type = InterfaceType.NON_STREAM
+        self.output_dir = output_dir
+        self.delete_audio_file = True
+        self.started = None
+        self.cancelled = None
+        self.release = None
+        self.swallow_cancel = False
+        self.next_text = "ok"
+
+    async def speech_to_text(self, opus_data, session_id, artifacts=None):
+        return self.next_text, None
+
+    async def speech_to_text_wrapper(self, pcm_data, session_id):
+        if self.started is not None:
+            self.started.set()
+        if self.release is not None:
+            try:
+                await self.release.wait()
+            except asyncio.CancelledError:
+                if self.cancelled is not None:
+                    self.cancelled.set()
+                if not self.swallow_cancel:
+                    raise
+        return self.next_text, None
+
+async def run():
+    cfg = await load_config()
+    cfg["delete_audio"] = True
+    pcm_chunk = b"\\x01\\x00" * 1920 * 16  # > 1920 * 15 threshold
+
+    for mode in ("auto", "realtime"):
+        # 1. Abort cancels in-flight VAD-triggered ASR immediately and clears registration.
+        asr = ControllableASR(os.environ["TEST_AUDIO_OUT"])
+        asr.started = asyncio.Event()
+        asr.cancelled = asyncio.Event()
+        asr.release = asyncio.Event()
+        asr.next_text = f"STALE_{mode.upper()}_ABORT"
+        conn = ConnectionHandler(cfg, None, asr, None, None, None)
+        conn.loop = asyncio.get_running_loop()
+        conn.asr = asr
+        conn.websocket = FakeWS()
+        conn.client_listen_mode = mode
+        conn.asr_audio = [pcm_chunk]
+        conn.client_have_voice = True
+        conn.client_voice_stop = True
+        events_log.clear()
+
+        t0 = time.monotonic()
+        await asr.receive_audio(conn, b"\\x00" * 1920, False)
+        assert time.monotonic() - t0 < 0.2, f"{mode} receive_audio blocked on ASR"
+        task = conn._passport_asr_task
+        assert task is not None and not task.done(), f"{mode} ASR task not registered"
+        await asyncio.wait_for(asr.started.wait(), 1.0)
+        await abort_handle.handleAbortMessage(conn)
+        await asyncio.wait_for(asr.cancelled.wait(), 1.0)
+        await asyncio.sleep(0.02)
+        assert task.done() and conn._passport_asr_task is None
+        assert events_log == [], f"{mode} aborted ASR leaked to report/chat: {events_log}"
+        await conn.close()
+
+        # 2. Even if a provider swallows cancellation and returns after abort, stale generation blocks STT/LLM.
+        asr_sw = ControllableASR(os.environ["TEST_AUDIO_OUT"])
+        asr_sw.started = asyncio.Event()
+        asr_sw.cancelled = asyncio.Event()
+        asr_sw.release = asyncio.Event()
+        asr_sw.swallow_cancel = True
+        asr_sw.next_text = f"SWALLOWED_{mode.upper()}"
+        conn_sw = ConnectionHandler(cfg, None, asr_sw, None, None, None)
+        conn_sw.loop = asyncio.get_running_loop()
+        conn_sw.asr = asr_sw
+        conn_sw.websocket = FakeWS()
+        conn_sw.client_listen_mode = mode
+        conn_sw.asr_audio = [pcm_chunk]
+        conn_sw.client_have_voice = True
+        conn_sw.client_voice_stop = True
+        events_log.clear()
+
+        await asr_sw.receive_audio(conn_sw, b"\\x00" * 1920, False)
+        sw_task = conn_sw._passport_asr_task
+        await asyncio.wait_for(asr_sw.started.wait(), 1.0)
+        await abort_handle.handleAbortMessage(conn_sw)
+        await asyncio.wait_for(asr_sw.cancelled.wait(), 1.0)
+        await asyncio.wait_for(sw_task, 1.0)
+        assert events_log == [], f"{mode} stale swallowed result entered report/chat: {events_log}"
+        await conn_sw.close()
+
+        # 3. Close cancels in-flight VAD-triggered ASR and blocks post-close dispatches.
+        asr_cl = ControllableASR(os.environ["TEST_AUDIO_OUT"])
+        asr_cl.started = asyncio.Event()
+        asr_cl.cancelled = asyncio.Event()
+        asr_cl.release = asyncio.Event()
+        asr_cl.next_text = f"STALE_{mode.upper()}_CLOSE"
+        conn_cl = ConnectionHandler(cfg, None, asr_cl, None, None, None)
+        conn_cl.loop = asyncio.get_running_loop()
+        conn_cl.asr = asr_cl
+        conn_cl.websocket = FakeWS()
+        conn_cl.client_listen_mode = mode
+        conn_cl.asr_audio = [pcm_chunk]
+        conn_cl.client_have_voice = True
+        conn_cl.client_voice_stop = True
+        events_log.clear()
+
+        await asr_cl.receive_audio(conn_cl, b"\\x00" * 1920, False)
+        cl_task = conn_cl._passport_asr_task
+        assert cl_task is not None
+        await asyncio.wait_for(asr_cl.started.wait(), 1.0)
+        await conn_cl.close()
+        assert asr_cl.cancelled.is_set() and cl_task.done()
+        assert conn_cl._passport_asr_task is None and conn_cl.stop_event.is_set()
+        assert events_log == [], f"{mode} closed ASR leaked to report/chat: {events_log}"
+
+        # Post-close receive_audio must not spawn new tasks.
+        conn_cl.asr_audio = [pcm_chunk]
+        conn_cl.client_have_voice = True
+        conn_cl.client_voice_stop = True
+        await asr_cl.receive_audio(conn_cl, b"\\x00" * 1920, False)
+        assert conn_cl._passport_asr_task is None
+
+        # 4. Barge-in when client_is_speaking=True must NOT self-cancel the winning ASR task.
+        asr_bi = ControllableASR(os.environ["TEST_AUDIO_OUT"])
+        asr_bi.next_text = f"BARGE_IN_{mode.upper()}"
+        conn_bi = ConnectionHandler(cfg, None, asr_bi, None, None, None)
+        conn_bi.loop = asyncio.get_running_loop()
+        conn_bi.asr = asr_bi
+        conn_bi.websocket = FakeWS()
+        conn_bi.client_listen_mode = mode
+        conn_bi.client_is_speaking = True
+        conn_bi.asr_audio = [pcm_chunk]
+        conn_bi.client_have_voice = True
+        conn_bi.client_voice_stop = True
+        events_log.clear()
+
+        await asr_bi.receive_audio(conn_bi, b"\\x00" * 1920, False)
+        bi_task = conn_bi._passport_asr_task
+        assert bi_task is not None
+        await asyncio.wait_for(bi_task, 1.0)
+        assert events_log == [
+            ("enqueue", mode, f"BARGE_IN_{mode.upper()}"),
+            ("chat", mode, f"BARGE_IN_{mode.upper()}"),
+        ], f"{mode} barge-in self-cancelled winning ASR task: {events_log}"
+        assert conn_bi.websocket.sent, "barge-in did not send tts.stop before chat"
+        await conn_bi.close()
+
+asyncio.run(run())
+"""
+        res = subprocess.run(
+            [sys.executable, "-c", probe_code],
+            env=_base_env(
+                XIAOZHI_HOME=str(srv_home),
+                PASSPORT_ROOT=str(ROOT),
+                PASSPORT_LOG_DIR=str(srv_home / "tmp"),
+                TEST_AUDIO_OUT=str(tmp / "asr_out"),
+            ),
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+        assert res.returncode == 0, (
+            f"auto/realtime ASR unit cancel probe failed ({res.returncode}):\n{res.stdout}\n{res.stderr}"
+        )
+    print("[PASS] auto/realtime ASR unit cancellation, stale-gen guard, close guard, and barge-in safety verified")
+
+
 async def _ws_expect_rejected(ws_url: str, headers: dict, label: str) -> None:
     try:
         async with websockets.connect(ws_url, additional_headers=headers) as ws:
@@ -5106,6 +5813,83 @@ async def _ws_expect_rejected(ws_url: str, headers: dict, label: str) -> None:
         return
 
 
+def _vad_utterance_opus_frames(server_home: Path) -> tuple[list[bytes], bytes]:
+    """Encode bundled 16 kHz mono speech WAV (>15 frames) plus a silence frame to trigger real Silero VAD."""
+    wav_path = server_home / "config" / "assets" / "wakeup_words_short.wav"
+    assert wav_path.is_file(), f"Missing bundled speech asset: {wav_path}"
+    with wave.open(str(wav_path), "rb") as wf:
+        assert wf.getframerate() == 16000 and wf.getnchannels() == 1 and wf.getsampwidth() == 2, (
+            f"Unexpected WAV format in {wav_path}: sr={wf.getframerate()} ch={wf.getnchannels()} sw={wf.getsampwidth()}"
+        )
+        raw_pcm = wf.readframes(wf.getnframes())
+    encoder = opuslib_next.Encoder(16000, 1, constants.APPLICATION_AUDIO)
+    speech_frames: list[bytes] = []
+    for off in range(0, len(raw_pcm), 1920):
+        chunk = raw_pcm[off : off + 1920]
+        if len(chunk) < 1920:
+            chunk += b"\x00" * (1920 - len(chunk))
+        speech_frames.append(encoder.encode(chunk, 960))
+    assert len(speech_frames) > 15, f"Speech asset too short for VAD trigger: {len(speech_frames)} frames"
+    silence_frame = encoder.encode(b"\x00" * 1920, 960)
+    return speech_frames, silence_frame
+
+
+async def _send_vad_utterance(
+    ws,
+    session_id: str,
+    mode: str,
+    speech_frames: list[bytes],
+    silence_frame: bytes,
+    *,
+    silence_count: int = 12,
+    silence_interval_s: float = 0.035,
+) -> None:
+    """Send listen.start + speech + silence in auto/realtime mode until VAD triggers voice stop."""
+    await ws.send(
+        json.dumps({"session_id": session_id, "type": "listen", "state": "start", "mode": mode})
+    )
+    for frame in speech_frames:
+        await ws.send(frame)
+    for _ in range(silence_count):
+        await asyncio.sleep(silence_interval_s)
+        await ws.send(silence_frame)
+
+
+async def _run_vad_turn(
+    ws,
+    session_id: str,
+    mode: str,
+    speech_frames: list[bytes],
+    silence_frame: bytes,
+    timeout_s: float = 15.0,
+) -> dict:
+    """Execute a complete VAD-triggered voice turn in auto or realtime mode and verify TTS completion."""
+    await _send_vad_utterance(ws, session_id, mode, speech_frames, silence_frame)
+    texts: list[str] = []
+    tts_states: list[str] = []
+    decoded = 0
+    decoder = opuslib_next.Decoder(16000, 1)
+    deadline = asyncio.get_running_loop().time() + timeout_s
+    while asyncio.get_running_loop().time() < deadline:
+        try:
+            raw = await asyncio.wait_for(ws.recv(), 2.0)
+        except asyncio.TimeoutError:
+            if tts_states and tts_states[-1] == "stop":
+                break
+            continue
+        if isinstance(raw, bytes):
+            decoded += len(decoder.decode(raw, 960))
+            continue
+        msg = json.loads(raw)
+        if msg.get("type") == "stt":
+            texts.append(msg.get("text", ""))
+        elif msg.get("type") == "tts":
+            tts_states.append(msg.get("state"))
+            if msg.get("state") == "stop":
+                break
+    return {"stt": texts, "tts_states": tts_states, "decoded_pcm_bytes": decoded}
+
+
 async def _run_live_server_regressions(
     ota_base: str,
     ws_url: str,
@@ -5114,6 +5898,7 @@ async def _run_live_server_regressions(
     auth_key: str,
     dev_a: dict,
     dev_b: dict,
+    server_home: Path,
 ) -> dict:
     issued_secrets = {dev_a["ota_secret"], dev_b["ota_secret"], auth_key}
     query_sentinel_1 = "qsec_" + secrets.token_hex(8)
@@ -5470,6 +6255,162 @@ async def _run_live_server_regressions(
         turn_rec = await run_turn(ws_rec, hello_rec["session_id"])
         assert "合约测试" in "".join(turn_rec["stt"])
 
+    # 3d & 3e. Auto and realtime VAD-triggered ASR abort cancellation + stale STT/LLM block + recovery.
+    speech_frames, silence_frame = _vad_utterance_opus_frames(server_home)
+    last_seen_req_id = req_disc_id
+    try:
+        for mode in ("auto", "realtime"):
+            stale_marker = f"STALE_{mode.upper()}_ABORT"
+            async with websockets.connect(ws_url, additional_headers=headers_a) as ws_vad:
+                hello_vad = await send_hello(ws_vad)
+                sid_vad = hello_vad["session_id"]
+                llm_before = int(_get_json(f"{fake_url}/_stats")["llm_total"])
+
+                post_json(
+                    f"{fake_url}/_control",
+                    {},
+                    {"asr_delays": [15.0], "transcript": stale_marker},
+                )
+                await _send_vad_utterance(ws_vad, sid_vad, mode, speech_frames, silence_frame)
+
+                t_wait_vad = time.monotonic()
+                req_vad_abort_id = None
+                while time.monotonic() - t_wait_vad < 5.0:
+                    stats = _get_json(f"{fake_url}/_stats")
+                    newer = [rid for rid in stats["asr_in_flight_ids"] if rid > last_seen_req_id]
+                    if newer:
+                        req_vad_abort_id = newer[-1]
+                        break
+                    await asyncio.sleep(0.05)
+                else:
+                    raise AssertionError(f"{mode} VAD slow ASR request never reached fake_provider")
+                last_seen_req_id = req_vad_abort_id
+                t_vad_started = time.monotonic()
+
+                t_vad_abort_sent = time.monotonic()
+                await ws_vad.send(
+                    json.dumps({"session_id": sid_vad, "type": "abort", "reason": "wake_word_detected"})
+                )
+                stop_deadline = t_vad_abort_sent + 1.5
+                stop_seen = False
+                while time.monotonic() < stop_deadline:
+                    rem = max(0.01, stop_deadline - time.monotonic())
+                    raw_msg = await asyncio.wait_for(ws_vad.recv(), rem)
+                    if isinstance(raw_msg, bytes):
+                        continue
+                    assert stale_marker not in raw_msg, f"{mode} aborted stale text reached client: {raw_msg!r}"
+                    parsed_msg = json.loads(raw_msg)
+                    if parsed_msg.get("type") == "tts" and parsed_msg.get("state") == "stop":
+                        stop_seen = True
+                        break
+                assert stop_seen, f"{mode} did not receive tts.stop within 1.5s after abort"
+
+                while time.monotonic() - t_vad_abort_sent < 1.2:
+                    stats = _get_json(f"{fake_url}/_stats")
+                    rec = next((r for r in stats["asr_requests"] if r["id"] == req_vad_abort_id), None)
+                    if (
+                        rec is not None
+                        and rec["state"] == "aborted"
+                        and req_vad_abort_id not in stats["asr_in_flight_ids"]
+                    ):
+                        break
+                    await asyncio.sleep(0.03)
+                else:
+                    raise AssertionError(
+                        f"{mode} aborted ASR req_id={req_vad_abort_id} did not disconnect within 1.2s"
+                    )
+                assert time.monotonic() - t_vad_started < 2.2, (
+                    f"{mode} aborted ASR elapsed too close to 4.0s ASR timeout"
+                )
+
+                # Observe briefly to confirm stale transcript never enters STT or LLM.
+                observe_end = time.monotonic() + 0.3
+                while time.monotonic() < observe_end:
+                    rem = max(0.01, observe_end - time.monotonic())
+                    try:
+                        extra = await asyncio.wait_for(ws_vad.recv(), rem)
+                    except asyncio.TimeoutError:
+                        break
+                    if isinstance(extra, str):
+                        assert stale_marker not in extra, f"{mode} aborted stale text reached client: {extra!r}"
+                assert int(_get_json(f"{fake_url}/_stats")["llm_total"]) == llm_before, (
+                    f"{mode} aborted ASR unexpectedly triggered LLM"
+                )
+
+                # Next VAD turn in the same mode completes cleanly.
+                post_json(f"{fake_url}/_control", {}, {"asr_delays": [0.0], "transcript": "合约测试"})
+                turn_ok = await _run_vad_turn(ws_vad, sid_vad, mode, speech_frames, silence_frame)
+                assert "合约测试" in "".join(turn_ok["stt"]), (mode, turn_ok)
+                assert turn_ok["decoded_pcm_bytes"] > 0 and "stop" in turn_ok["tts_states"], (mode, turn_ok)
+                assert int(_get_json(f"{fake_url}/_stats")["llm_total"]) == llm_before + 1
+
+        # 3f & 3g. Auto and realtime VAD-triggered ASR abrupt disconnect cancel + reconnect recovery.
+        for mode in ("auto", "realtime"):
+            stale_disc_marker = f"STALE_{mode.upper()}_DISC"
+            llm_before_disc = int(_get_json(f"{fake_url}/_stats")["llm_total"])
+            post_json(
+                f"{fake_url}/_control",
+                {},
+                {"asr_delays": [15.0], "transcript": stale_disc_marker},
+            )
+            ws_vad_disc = await websockets.connect(ws_url, additional_headers=headers_a)
+            try:
+                hello_vd = await send_hello(ws_vad_disc)
+                await _send_vad_utterance(
+                    ws_vad_disc, hello_vd["session_id"], mode, speech_frames, silence_frame
+                )
+
+                t_vd_wait = time.monotonic()
+                req_vd_id = None
+                while time.monotonic() - t_vd_wait < 5.0:
+                    stats = _get_json(f"{fake_url}/_stats")
+                    newer = [rid for rid in stats["asr_in_flight_ids"] if rid > last_seen_req_id]
+                    if newer:
+                        req_vd_id = newer[-1]
+                        break
+                    await asyncio.sleep(0.05)
+                else:
+                    raise AssertionError(f"{mode} disconnect-test ASR request never started")
+                last_seen_req_id = req_vd_id
+                t_vd_started = time.monotonic()
+
+                t_vd_dropped = time.monotonic()
+                if ws_vad_disc.transport is not None:
+                    ws_vad_disc.transport.abort()
+                else:
+                    await ws_vad_disc.close()
+            finally:
+                if ws_vad_disc.transport is not None and not ws_vad_disc.transport.is_closing():
+                    ws_vad_disc.transport.abort()
+
+            while time.monotonic() - t_vd_dropped < 1.5:
+                stats = _get_json(f"{fake_url}/_stats")
+                rec = next((r for r in stats["asr_requests"] if r["id"] == req_vd_id), None)
+                if rec is not None and rec["state"] == "aborted" and req_vd_id not in stats["asr_in_flight_ids"]:
+                    break
+                await asyncio.sleep(0.03)
+            else:
+                raise AssertionError(f"{mode} disconnected WS ASR req_id={req_vd_id} did not abort within 1.5s")
+            assert time.monotonic() - t_vd_started < 2.5, (
+                f"{mode} WebSocket disconnect cancel elapsed too close to 4.0s ASR timeout"
+            )
+            await asyncio.sleep(0.3)
+            assert int(_get_json(f"{fake_url}/_stats")["llm_total"]) == llm_before_disc, (
+                f"{mode} disconnected ASR unexpectedly triggered LLM"
+            )
+
+            post_json(f"{fake_url}/_control", {}, {"asr_delays": [0.0], "transcript": "合约测试"})
+            async with websockets.connect(ws_url, additional_headers=headers_a) as ws_vd_rec:
+                hello_vdr = await send_hello(ws_vd_rec)
+                turn_vdr = await _run_vad_turn(
+                    ws_vd_rec, hello_vdr["session_id"], mode, speech_frames, silence_frame
+                )
+                assert "合约测试" in "".join(turn_vdr["stt"]), (mode, turn_vdr)
+                assert turn_vdr["decoded_pcm_bytes"] > 0 and "stop" in turn_vdr["tts_states"], (mode, turn_vdr)
+                assert int(_get_json(f"{fake_url}/_stats")["llm_total"]) == llm_before_disc + 1
+    finally:
+        post_json(f"{fake_url}/_control", {}, {"asr_delays": [], "transcript": "合约测试"})
+
     # --- Live device revocation ---
     subprocess.run(
         [
@@ -5496,7 +6437,7 @@ async def _run_live_server_regressions(
     print(
         f"[PASS] blockers #1 & non-blocker #5: OTA/WS device auth, allowlist bypass closed, "
         f"Session B ({b_elapsed:.2f}s) completed while Session A still in flight, "
-        f"timeout, abort cancel, & disconnect cancel verified"
+        f"timeout, manual + auto/realtime abort cancel & disconnect cancel verified"
     )
     return {"secrets_to_check": issued_secrets}
 
@@ -6272,6 +7213,7 @@ def main() -> None:
         try:
             _wait_for_http_ready(f"http://127.0.0.1:{fake_port}/_stats", fake_proc, fake_log)
             test_async_asr_nonblocking_disk_io(server_home, fake_port)
+            test_auto_realtime_asr_cancel_unit(server_home)
 
             with open(server_stdout_log, "w", encoding="utf-8") as sout:
                 server_proc = subprocess.Popen(
@@ -6297,6 +7239,7 @@ def main() -> None:
                     auth_key=auth_key,
                     dev_a=dev_a,
                     dev_b=dev_b,
+                    server_home=server_home,
                 )
             )
             res["secrets_to_check"].update(nginx_tokens)
