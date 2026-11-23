@@ -22,12 +22,14 @@
 #   before any location / proxy / body-size error can be logged, blocking literal,
 #   percent-encoded, dot-segment, userinfo, and query-bearing Referers alike.
 # - In addition, `access_log` uses `if=$passport_log_access` to skip access-log
-#   writes whenever `$passport_unsafe_referer` rejects a request (or when a
-#   server-level guard rejects a `/xiaozhi/ota/d/` URI before location matching),
-#   preventing an access-log write failure / short write (`[alert]`) from leaking
-#   raw `Referer` or secret request lines into `passport_error.log`.
-#   Observability trade-off: 400 rejections from `$passport_unsafe_referer` are
-#   not written to `passport_access.log`; normal permitted traffic keeps logging.
+#   writes whenever `$passport_unsafe_referer` or `$passport_credential_query`
+#   rejects a request (or when a server-level guard rejects a `/xiaozhi/ota/d/`
+#   URI before location matching), preventing an access-log write failure /
+#   short write (`[alert]`) from leaking raw `Referer` or raw credential-bearing
+#   request lines into `passport_error.log`.
+#   Observability trade-off: 400 rejections from `$passport_unsafe_referer` or
+#   `$passport_credential_query` are not written to `passport_access.log`;
+#   permitted non-credential-query traffic keeps full access logging.
 # - If APM / OpenTelemetry / WAF / ingress tracing is enabled on this proxy,
 #   disable trace capture or scrub `http.target`, `url.path`, `url.full`, and
 #   `http.url` on `/xiaozhi/ota/d/*` so per-device secrets do not enter traces.
@@ -58,18 +60,32 @@ map $http_referer $passport_unsafe_referer {
     default                                                     1;
 }
 
-# Skip access_log writes whenever the Referer allowlist rejects a request (or
-# when a server-level guard rejects a `/xiaozhi/ota/d/` URI before location
-# matching). Otherwise, an access_log write failure or short write causes Nginx
-# (`ngx_http_log_write`) to emit an `[alert]` to `r->connection->log`, whose
-# error-log formatter appends the RAW client `referrer` (and raw request line).
-# Observability trade-off: 400 rejections from `$passport_unsafe_referer` are
-# intentionally omitted from `passport_access.log`; allowed requests (empty or
-# bare-origin Referer on non-secret routes) keep full access & error logging.
-map "$passport_unsafe_referer:$uri" $passport_log_access {
-    ~^1:                       0;
-    ~(?i)^0:/xiaozhi/+ota/+d/  0;
-    default                    1;
+# Reject credentials passed in query strings. Shared between the server/location
+# guards (`if ($passport_credential_query) { return 400; }`) and conditional
+# access logging (`$passport_log_access`) so rejected credential-bearing queries
+# never attempt an access_log write (which on write failure / short write emits
+# an `[alert]` to `passport_error.log` containing the raw request line).
+map $args $passport_credential_query {
+    ~*(^|&)(authorization|token|access_token|refresh_token|id_token|secret|ota_secret|key|api_key|apikey|password|sig|signature|auth)= 1;
+    default                                                                                                                             0;
+}
+
+# Skip access_log writes whenever the Referer allowlist or credential-query
+# guard rejects a request (or when a server-level guard rejects a
+# `/xiaozhi/ota/d/` URI before location matching). Otherwise, an access_log
+# write failure or short write causes Nginx (`ngx_http_log_write`) to emit an
+# `[alert]` to `r->connection->log`, whose error-log formatter appends the RAW
+# client `referrer` and RAW request line (including query parameter values).
+# Observability trade-off: 400 rejections from `$passport_unsafe_referer` or
+# `$passport_credential_query` are intentionally omitted from
+# `passport_access.log`; allowed requests (empty or bare-origin Referer without
+# credential query parameters on non-secret routes) keep full access & error
+# logging.
+map "$passport_unsafe_referer:$passport_credential_query:$uri" $passport_log_access {
+    ~^1:                         0;
+    ~^0:1:                       0;
+    ~(?i)^0:0:/xiaozhi/+ota/+d/  0;
+    default                      1;
 }
 
 # Access logs omit $http_referer completely (emitting literal `"-"`) so no
@@ -104,8 +120,9 @@ server {
         return 400;
     }
 
-    # Reject credentials passed in query strings before routing/proxying.
-    if ($args ~* "(^|&)(authorization|token|access_token|refresh_token|id_token|secret|ota_secret|key|api_key|apikey|password|sig|signature|auth)=") {
+    # Reject credentials passed in query strings before routing/proxying (shared
+    # with `$passport_log_access` so rejected queries skip access_log writes).
+    if ($passport_credential_query) {
         return 400;
     }
 
@@ -116,7 +133,7 @@ server {
         log_not_found off;
         log_subrequest off;
 
-        if ($args ~* "(^|&)(authorization|token|access_token|refresh_token|id_token|secret|ota_secret|key|api_key|apikey|password|sig|signature|auth)=") {
+        if ($passport_credential_query) {
             return 400;
         }
 
@@ -128,7 +145,7 @@ server {
 
             set $passport_ota_secret $ota_secret_cap;
 
-            if ($args ~* "(^|&)(authorization|token|access_token|refresh_token|id_token|secret|ota_secret|key|api_key|apikey|password|sig|signature|auth)=") {
+            if ($passport_credential_query) {
                 return 400;
             }
 

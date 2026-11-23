@@ -33,7 +33,7 @@ import zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Optional
-from urllib.parse import unquote, urlsplit
+from urllib.parse import parse_qs, unquote, urlsplit
 
 import websockets
 import yaml
@@ -56,6 +56,7 @@ from contract_test import (
 from passport_server.device_auth import PassportDeviceAuth, hash_ota_secret
 from passport_server.fs_utils import atomic_write_private, locked_file
 from passport_server.redaction import (
+    SENSITIVE_QUERY_KEYS,
     clear_registered_secrets,
     has_sensitive_query_params,
     install_stdlib_redaction,
@@ -1273,8 +1274,10 @@ def test_demo_isolation_preserves_real_state(server_home: Path) -> None:
         real_srv_log = copy_runtime / "real-server.log"
         real_cfg_yaml = copy_runtime / "real-config.yaml"
         real_fake_log = copy_runtime / "real-fake.log"
-        for real_path in (real_srv_log, real_cfg_yaml, real_fake_log):
+        real_pth_sentinel = copy_runtime / "real-pth-sentinel.txt"
+        for real_path in (real_srv_log, real_cfg_yaml, real_fake_log, real_pth_sentinel):
             real_path.write_text(f"real-state-{real_path.name}\n", encoding="utf-8")
+        real_pth_ino = os.stat(real_pth_sentinel).st_ino
         symlinked_outputs = {
             demo_root / "xiaozhi-server.log": copy_devices,
             demo_root / "auth_key": copy_auth,
@@ -1286,7 +1289,7 @@ def test_demo_isolation_preserves_real_state(server_home: Path) -> None:
             link_path.symlink_to(target)
         hardlinked_output = demo_root / "fake-provider.log"
         os.link(real_fake_log, hardlinked_output)
-        linked_before = _snapshot_files([real_srv_log, real_cfg_yaml, real_fake_log])
+        linked_before = _snapshot_files([real_srv_log, real_cfg_yaml, real_fake_log, real_pth_sentinel])
         copy_entries_before = sorted(p.name for p in copy_runtime.iterdir())
         real_entries_before = sorted(p.name for p in (ROOT / "runtime").iterdir()) if (ROOT / "runtime").is_dir() else None
         shared_venv_before = _tree_signature(ROOT / "runtime" / "venv") if (ROOT / "runtime" / "venv").exists() else None
@@ -1365,6 +1368,65 @@ def test_demo_isolation_preserves_real_state(server_home: Path) -> None:
                     assert synthetic_real_key.encode() not in fpath.read_bytes(), (
                         f"inherited PASSPORT_AUTH_KEY leaked into demo output {fpath.name}"
                     )
+
+        # Reused demo venv + same-version shared runtime/venv branch:
+        # if zz_passport_shared_readonly.pth is hard-linked to a real sentinel file,
+        # refreshing it must atomically replace the entry without altering sentinel bytes or inode.
+        demo_purelib = Path(
+            subprocess.check_output(
+                [str(demo_venv / "bin" / "python"), "-c", 'import sysconfig; print(sysconfig.get_paths()["purelib"])'],
+                text=True,
+            ).strip()
+        ).resolve()
+        demo_pth = demo_purelib / "zz_passport_shared_readonly.pth"
+        assert demo_pth.is_file() and not demo_pth.is_symlink(), (
+            f"expected {demo_pth} after initial shared-venv demo run"
+        )
+        demo_pth.unlink()
+        os.link(real_pth_sentinel, demo_pth)
+        assert os.stat(demo_pth).st_ino == real_pth_ino
+        assert os.stat(real_pth_sentinel).st_nlink == 2
+
+        reuse_res = subprocess.run(
+            ["sh", str(passport_copy / "scripts" / "run_isolated.sh")],
+            env=_base_env(
+                PASSPORT_SKIP_REGRESSION="1",
+                PASSPORT_PYTHON=sys.executable,
+                PASSPORT_AUTH_KEY=synthetic_real_key,
+                PASSPORT_WS_BIND_PORT=str(_free_port()),
+                PASSPORT_HTTP_BIND_PORT=str(_free_port()),
+                PASSPORT_FAKE_PORT=str(_free_port()),
+            ),
+            capture_output=True,
+            text=True,
+            timeout=180,
+        )
+        assert reuse_res.returncode == 0, (
+            f"reused-venv run_isolated.sh failed ({reuse_res.returncode}):\n"
+            f"{redact_text(reuse_res.stdout)}\n{redact_text(reuse_res.stderr)}"
+        )
+        assert "PASSED tightened upstream websocket contract with local fake providers" in reuse_res.stdout
+        assert synthetic_real_key not in reuse_res.stdout + reuse_res.stderr
+        _assert_files_unchanged(linked_before, "reused-venv hard-linked pth sentinel")
+        _assert_files_unchanged(copy_before, "reused-venv isolated copy runtime/")
+        _assert_files_unchanged(real_before, "reused-venv real passport/runtime/")
+        pth_sentinel_stat = os.stat(real_pth_sentinel)
+        assert pth_sentinel_stat.st_ino == real_pth_ino, (
+            "reused-venv run_isolated.sh altered real-pth-sentinel inode"
+        )
+        assert pth_sentinel_stat.st_nlink == 1, (
+            f"zz_passport_shared_readonly.pth still shares a hard link with sentinel (nlink={pth_sentinel_stat.st_nlink})"
+        )
+        assert demo_pth.is_file() and not demo_pth.is_symlink(), (
+            "zz_passport_shared_readonly.pth missing or symlink after reused-venv run"
+        )
+        assert os.stat(demo_pth).st_ino != real_pth_ino, (
+            "zz_passport_shared_readonly.pth still shares inode with real-pth-sentinel"
+        )
+        assert "site.addsitedir(" in demo_pth.read_text(encoding="utf-8")
+        assert _tree_signature(sim_shared_venv) == sim_shared_before, (
+            "reused-venv run_isolated.sh modified simulated shared runtime/venv"
+        )
 
         # write_config.py demo mode directly: env key and config-embedded key ignored.
         wc_home = tmp / "wc_demo_home"
@@ -1622,6 +1684,22 @@ def test_demo_pip_controlled_install_isolation(server_home: Path) -> None:
             check=True,
             capture_output=True,
         )
+        demo_site_pre = Path(
+            subprocess.check_output(
+                [str(demo_venv / "bin" / "python"), "-c", 'import sysconfig; print(sysconfig.get_paths()["purelib"])'],
+                text=True,
+            ).strip()
+        ).resolve()
+        pip_pth_sentinel = copy_runtime / "real-pip-pth-sentinel.txt"
+        pip_pth_sentinel_bytes = f"pip-pth-sentinel-{secrets.token_hex(8)}\n".encode("utf-8")
+        pip_pth_sentinel.write_bytes(pip_pth_sentinel_bytes)
+        pip_pth_sentinel_ino = os.stat(pip_pth_sentinel).st_ino
+        demo_pth_pre = demo_site_pre / "zz_passport_shared_readonly.pth"
+        if demo_pth_pre.exists() or demo_pth_pre.is_symlink():
+            demo_pth_pre.unlink()
+        os.link(pip_pth_sentinel, demo_pth_pre)
+        assert os.stat(demo_pth_pre).st_ino == pip_pth_sentinel_ino
+        assert os.stat(pip_pth_sentinel).st_nlink == 2
         hostile_cfg_body = f"[install]\ntarget = {sim_shared_site}\n"
         (demo_venv / "pip.conf").write_text(hostile_cfg_body, encoding="utf-8")
 
@@ -1672,6 +1750,13 @@ def test_demo_pip_controlled_install_isolation(server_home: Path) -> None:
             ).strip()
         ).resolve()
         assert demo_venv.resolve() in demo_site.parents
+        assert pip_pth_sentinel.read_bytes() == pip_pth_sentinel_bytes, (
+            "run_isolated.sh altered hard-linked .pth sentinel bytes before pip preflight"
+        )
+        pip_sentinel_stat = os.stat(pip_pth_sentinel)
+        assert pip_sentinel_stat.st_ino == pip_pth_sentinel_ino
+        assert pip_sentinel_stat.st_nlink == 1
+        assert os.stat(demo_site / "zz_passport_shared_readonly.pth").st_ino != pip_pth_sentinel_ino
         installed_init = demo_site / "passport_demo_probe" / "__init__.py"
         installed_meta = demo_site / "passport_demo_probe-0.1.0.dist-info" / "METADATA"
         assert installed_init.is_file() and installed_meta.is_file(), (
@@ -1917,8 +2002,13 @@ def test_reverse_proxy_templates_and_forwarding(ota_base: str, dev_a: dict) -> N
     _, query_rules = _nginx_map_rules(nginx_text, "passport_safe_query")
     ref_src, unsafe_ref_rules = _nginx_map_rules(nginx_text, "passport_unsafe_referer")
     assert ref_src == "http_referer"
+    cred_q_src, cred_q_rules = _nginx_map_rules(nginx_text, "passport_credential_query")
+    assert cred_q_src == "args"
+    assert ("$passport_credential_query", 400) in _nginx_server_guards(nginx_text), (
+        "Missing shared server-level $passport_credential_query guard"
+    )
     log_src, _ = _nginx_map_rules(nginx_text, "passport_log_access")
-    assert "$passport_unsafe_referer" in log_src and "$uri" in log_src, (
+    assert "$passport_unsafe_referer" in log_src and "$passport_credential_query" in log_src and "$uri" in log_src, (
         f"Unexpected $passport_log_access source expression: {log_src}"
     )
 
@@ -1939,6 +2029,35 @@ def test_reverse_proxy_templates_and_forwarding(ota_base: str, dev_a: dict) -> N
             assert rendered_uri.startswith("/xiaozhi/ota/d/[REDACTED]/"), rendered_uri
         for forbidden in (syn_secret, syn_qtok, syn_user, syn_pass):
             assert forbidden not in rendered_uri, f"Nginx URI map leaked secret: {rendered_uri}"
+
+    # Verify $passport_credential_query matches every sensitive query key and shares
+    # the decision with $passport_log_access (while benign queries still log safely).
+    for qk in sorted(SENSITIVE_QUERY_KEYS):
+        for q_sample in (f"{qk}={syn_qtok}", f"{qk.upper()}={syn_qtok}", f"probe=1&{qk}={syn_qtok}"):
+            assert _eval_nginx_map(cred_q_rules, q_sample) == "1", (
+                f"$passport_credential_query missed {q_sample!r}"
+            )
+            assert (
+                _eval_nginx_var(
+                    nginx_text,
+                    "passport_log_access",
+                    norm_path="/xiaozhi/ota/",
+                    query=q_sample,
+                    headers={"Referer": "https://proxy.example/"},
+                )
+                == "0"
+            ), f"$passport_log_access did not skip rejected query on normal route: {q_sample!r}"
+    assert _eval_nginx_map(cred_q_rules, f"probe={syn_qtok}") == "0"
+    assert (
+        _eval_nginx_var(
+            nginx_text,
+            "passport_log_access",
+            norm_path="/xiaozhi/ota/",
+            query=f"probe={syn_qtok}",
+            headers={"Referer": "https://proxy.example/"},
+        )
+        == "1"
+    )
 
     # Verify $passport_unsafe_referer strict allowlist & $passport_log_access conditional suppression.
     for safe_ref in ("", "https://proxy.example", "https://proxy.example/", "http://127.0.0.1:8443/", "https://[::1]:8443/"):
@@ -1995,6 +2114,7 @@ def test_reverse_proxy_templates_and_forwarding(ota_base: str, dev_a: dict) -> N
     assert "error_log /dev/null emerg;" in ota_block
     assert "log_not_found off;" in ota_block
     assert "log_subrequest off;" in ota_block
+    assert "if ($passport_credential_query)" in ota_block
 
     nested_match = re.search(
         r"location\s+~\s+\^/xiaozhi/ota/d/\(\?<ota_secret_cap>\[\^/\]\+\)/\?\$\s*\{(.*?)\n        \}",
@@ -2006,10 +2126,10 @@ def test_reverse_proxy_templates_and_forwarding(ota_base: str, dev_a: dict) -> N
     assert nested_block.count("access_log off;") >= 1
     assert nested_block.count("error_log /dev/null emerg;") >= 1
     idx_set = nested_block.find("set $passport_ota_secret $ota_secret_cap;")
-    idx_if = nested_block.find("if ($args ~*")
+    idx_if = nested_block.find("if ($passport_credential_query)")
     idx_rw = nested_block.find("rewrite ^ /xiaozhi/ota/? break;")
     assert 0 <= idx_set < idx_if < idx_rw, (
-        "Nginx nested OTA block must capture $passport_ota_secret before `if ($args ~* ...)` and `rewrite`"
+        "Nginx nested OTA block must capture $passport_ota_secret before `if ($passport_credential_query)` and `rewrite`"
     )
     assert "proxy_set_header X-OTA-Secret $passport_ota_secret;" in nested_block
     for stripped in (
@@ -2045,6 +2165,23 @@ def test_reverse_proxy_templates_and_forwarding(ota_base: str, dev_a: dict) -> N
     assert "rewrite * /xiaozhi/ota/" in caddy_text
     assert "header_up X-OTA-Secret {re.ota.1}" in caddy_text
     assert "respond @credential_query 400" in caddy_text
+    caddy_adapted = _caddy_adapt_site(caddy_text)
+    cred_matcher = caddy_adapted["matchers"].get("@credential_query", [])
+    assert cred_matcher and all(sub["kind"] == "vars_regexp" for sub in cred_matcher), (
+        f"@credential_query must use vars_regexp instead of AND'd query matcher: {cred_matcher}"
+    )
+    assert len(caddy_adapted["routes"]) == 1 and caddy_adapted["routes"][0]["tokens"] == ["route"], (
+        "Caddy site handlers must be wrapped inside an ordered `route { ... }` block"
+    )
+    route_children = [c["tokens"] for c in caddy_adapted["routes"][0]["children"] or []]
+    idx_log_skip = route_children.index(["log_skip", "@ota_secret_prefix"])
+    idx_resp_cred = route_children.index(["respond", "@credential_query", "400"])
+    first_proxy_idx = min(
+        i for i, toks in enumerate(route_children) if toks[0] in ("handle", "reverse_proxy")
+    )
+    assert 0 <= idx_log_skip < idx_resp_cred < first_proxy_idx, (
+        f"Unexpected ordered Caddy route sequence: {route_children}"
+    )
     for caddy_strip in (
         "header_up -Authorization",
         "header_up -X-Original-URI",
@@ -2110,7 +2247,7 @@ def test_reverse_proxy_templates_and_forwarding(ota_base: str, dev_a: dict) -> N
                 self.wfile.write(resp_body)
                 return
 
-            if query and PROXY_SENSITIVE_QUERY_RE.search(query):
+            if query and _eval_nginx_map(cred_q_rules, query) not in ("", "0"):
                 resp_body = b'{"success":false,"message":"query credentials forbidden"}'
                 # Record the access-log line before replying so the client never races the log.
                 if self._should_access_log(norm_path, query):
@@ -2265,12 +2402,20 @@ def test_reverse_proxy_templates_and_forwarding(ota_base: str, dev_a: dict) -> N
         )
         assert st_bad == 403
 
-        # 4. Safe GET /xiaozhi/ota/ & query-param GET /xiaozhi/ota/?token=... logged safely.
+        # 4. Safe GET /xiaozhi/ota/ & benign-query GET /xiaozhi/ota/?probe=... logged safely,
+        # while credential-query POST /xiaozhi/ota/?token=... returns 400 and skips access_log.
+        benign_q = "q_benign_" + secrets.token_hex(8)
         with urllib.request.urlopen(f"{proxy_base}/xiaozhi/ota/", timeout=5) as r_get:
             assert r_get.status == 200
+        with urllib.request.urlopen(f"{proxy_base}/xiaozhi/ota/?probe={benign_q}", timeout=5) as r_benign:
+            assert r_benign.status == 200
         st_get_q, _ = post_json(
             f"{proxy_base}/xiaozhi/ota/?token={q_sentinel}",
-            {"Device-Id": dev_a["device_id"], "Client-Id": dev_a["client_id"]},
+            {
+                "Device-Id": dev_a["device_id"],
+                "Client-Id": dev_a["client_id"],
+                "Referer": "https://proxy.example/",
+            },
         )
         assert st_get_q == 400
 
@@ -2281,11 +2426,190 @@ def test_reverse_proxy_templates_and_forwarding(ota_base: str, dev_a: dict) -> N
         assert not any("/xiaozhi/ota/d/" in line for line in proxy_access_logs), (
             f"Secret route or unsafe-Referer rejection entered access log: {proxy_access_logs}"
         )
-        for forbidden in (dev_a["ota_secret"], wrong_secret, q_sentinel, issued_ws_token, issued_ws_token_enc):
+        for forbidden in (dev_a["ota_secret"], wrong_secret, q_sentinel, benign_q, issued_ws_token, issued_ws_token_enc):
             assert forbidden not in joined_proxy_logs, "Proxy log leaked credential!"
     finally:
         proxy_srv.shutdown()
         proxy_srv.server_close()
+
+    # Behavioral Caddyfile adapter/router semantic test (in-process model, NOT real Caddy).
+    def _drive_caddy_model(tpl_text: str):
+        adapted = _caddy_adapt_site(tpl_text)
+        global_sinks = _caddy_log_sinks(tpl_text)
+        access_sink = _caddy_site_access_sink(tpl_text)
+        upstream_hits: list[tuple[str, str, str, dict[str, str]]] = []
+        hit_lock = threading.Lock()
+
+        def _caddy_upstream(
+            method: str,
+            target_upstream: str,
+            target_path: str,
+            raw_query: str,
+            fwd_headers: dict[str, str],
+            raw_body: bytes,
+        ):
+            with hit_lock:
+                upstream_hits.append((target_upstream, target_path, raw_query, dict(fwd_headers)))
+            if target_upstream == "127.0.0.1:18010":
+                return 200, b"{}", "application/json"
+            full_target = ota_base.rstrip("/") + target_path + (f"?{raw_query}" if raw_query else "")
+            req = urllib.request.Request(
+                full_target,
+                data=raw_body if method == "POST" else None,
+                headers=fwd_headers,
+                method=method,
+            )
+            try:
+                with urllib.request.urlopen(req, timeout=10) as resp:
+                    return resp.status, resp.read(), resp.headers.get("Content-Type", "application/json")
+            except urllib.error.HTTPError as exc:
+                return exc.code, exc.read(), exc.headers.get("Content-Type", "application/json")
+
+        class _TemplateCaddyHandler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def log_message(self, fmt, *args):
+                pass
+
+            def _handle(self, method: str) -> None:
+                length = int(self.headers.get("Content-Length", "0"))
+                raw_body = self.rfile.read(length) if length > 0 else b""
+                hdrs = {k: v for k, v in self.headers.items()}
+                status, resp_body, ctype = _caddy_execute_routes(
+                    adapted,
+                    method=method,
+                    raw_target=self.path,
+                    headers=hdrs,
+                    body=raw_body,
+                    upstream_fn=_caddy_upstream,
+                    sinks=global_sinks,
+                    access_sink=access_sink,
+                )
+                self.send_response(status)
+                self.send_header("Content-Type", ctype)
+                self.send_header("Content-Length", str(len(resp_body)))
+                self.end_headers()
+                self.wfile.write(resp_body)
+
+            def do_GET(self):
+                self._handle("GET")
+
+            def do_POST(self):
+                self._handle("POST")
+
+        c_srv = ThreadingHTTPServer(("127.0.0.1", _free_port()), _TemplateCaddyHandler)
+        c_srv.daemon_threads = True
+        threading.Thread(target=c_srv.serve_forever, daemon=True).start()
+        return c_srv, f"http://127.0.0.1:{c_srv.server_address[1]}", upstream_hits, access_sink, global_sinks
+
+    caddy_srv, caddy_base, caddy_hits, caddy_acc_sink, caddy_global_sinks = _drive_caddy_model(caddy_text)
+    caddy_q_sentinel = "q_caddy_" + secrets.token_hex(8)
+    caddy_benign_q = "q_caddy_ok_" + secrets.token_hex(6)
+    caddy_ws_token = ""
+    try:
+        # 1. Every single credential key (lowercase, uppercase, or non-first param) returns 400
+        #    ahead of all proxy handles with ZERO upstream hits.
+        for qk in sorted(SENSITIVE_QUERY_KEYS):
+            for q_pair in (f"{qk}={caddy_q_sentinel}", f"{qk.upper()}={caddy_q_sentinel}", f"probe=1&{qk}={caddy_q_sentinel}"):
+                for route_path in (
+                    "/xiaozhi/ota/",
+                    f"/xiaozhi/ota/d/{dev_a['ota_secret']}/",
+                    "/mcp/vision/explain",
+                    "/xiaozhi/v1/",
+                ):
+                    st_cq, _ = post_json(
+                        f"{caddy_base}{route_path}?{q_pair}",
+                        {"Device-Id": dev_a["device_id"], "Client-Id": dev_a["client_id"]},
+                    )
+                    assert st_cq == 400, (
+                        f"Caddy model failed to reject {route_path}?{q_pair}: got {st_cq}"
+                    )
+        assert caddy_hits == [], f"Credential queries reached Caddy upstream: {caddy_hits}"
+
+        # Also test GET with single credential query key on normal routes.
+        for get_path in (f"/xiaozhi/ota/?token={caddy_q_sentinel}", f"/xiaozhi/v1/?api_key={caddy_q_sentinel}"):
+            try:
+                with urllib.request.urlopen(f"{caddy_base}{get_path}", timeout=5):
+                    raise AssertionError(f"Expected 400 on GET {get_path}")
+            except urllib.error.HTTPError as exc:
+                assert exc.code == 400, f"Unexpected GET status on {get_path}: {exc.code}"
+        assert caddy_hits == []
+
+        # 2. Valid per-device OTA secret route rewrites to /xiaozhi/ota/, injects X-OTA-Secret,
+        #    strips tracing headers, skips access logs, and returns live WS token.
+        st_c_ok, body_c_ok = post_ota(
+            caddy_base,
+            {
+                "Device-Id": dev_a["device_id"],
+                "Client-Id": dev_a["client_id"],
+                "X-Original-URI": f"/xiaozhi/ota/d/{dev_a['ota_secret']}/",
+                "Referer": f"https://proxy.example/xiaozhi/ota/d/{dev_a['ota_secret']}/",
+            },
+            secret=dev_a["ota_secret"],
+        )
+        assert st_c_ok == 200 and body_c_ok["websocket"]["token"], f"Caddy OTA forward failed: {st_c_ok} {body_c_ok}"
+        caddy_ws_token = body_c_ok["websocket"]["token"]
+        assert len(caddy_hits) == 1
+        hit_up, hit_path, _hit_q, hit_hdrs = caddy_hits[0]
+        assert hit_up == "127.0.0.1:18013" and hit_path == "/xiaozhi/ota/"
+        assert hit_hdrs.get("X-OTA-Secret") == dev_a["ota_secret"]
+        lower_hit_hdrs = {k.lower() for k in hit_hdrs}
+        for scrubbed in ("authorization", "x-original-uri", "referer"):
+            assert scrubbed not in lower_hit_hdrs, f"Caddy failed to scrub {scrubbed}"
+
+        # 3. Unknown subpath under /xiaozhi/ota/d/* hits @ota_secret_prefix -> 404 (not upstream), log skipped.
+        st_c_404, _ = post_json(f"{caddy_base}/xiaozhi/ota/d/{dev_a['ota_secret']}/extra", {})
+        assert st_c_404 == 404 and len(caddy_hits) == 1
+
+        # 4. Benign query GET /xiaozhi/ota/?probe=... reaches upstream (200) and logs redacted URI.
+        with urllib.request.urlopen(f"{caddy_base}/xiaozhi/ota/?probe={caddy_benign_q}", timeout=5) as r_c_ben:
+            assert r_c_ben.status == 200
+        assert len(caddy_hits) == 2
+
+        # 5. Unknown path outside handles hits fallback `respond 404`.
+        try:
+            with urllib.request.urlopen(f"{caddy_base}/unknown", timeout=5):
+                raise AssertionError("Expected 404 on /unknown")
+        except urllib.error.HTTPError as exc:
+            assert exc.code == 404
+        assert len(caddy_hits) == 2
+
+        # Verify site access log skipped /xiaozhi/ota/d/* and redacted all URIs/headers.
+        assert not any("/xiaozhi/ota/d/" in ln for ln in caddy_acc_sink["lines"]), (
+            f"Caddy access log recorded /xiaozhi/ota/d/ despite log_skip: {caddy_acc_sink['lines']}"
+        )
+        all_caddy_lines = list(caddy_acc_sink["lines"]) + [ln for s in caddy_global_sinks for ln in s["lines"]]
+        assert len(caddy_acc_sink["lines"]) >= 2
+        assert all('"uri": "[REDACTED]"' in ln for ln in caddy_acc_sink["lines"])
+        joined_caddy_logs = "\n".join(all_caddy_lines)
+        for forbidden in (dev_a["ota_secret"], caddy_q_sentinel, caddy_benign_q, caddy_ws_token):
+            assert forbidden not in joined_caddy_logs, "Caddy model log leaked credential!"
+    finally:
+        caddy_srv.shutdown()
+        caddy_srv.server_close()
+
+    # Caddy negative control A: multi-key `query` matcher ANDs distinct keys, letting single ?token=... pass to upstream.
+    caddy_legacy_query = _caddy_with_legacy_and_query(caddy_text)
+    neg_a_srv, neg_a_base, neg_a_hits, _, _ = _drive_caddy_model(caddy_legacy_query)
+    try:
+        with urllib.request.urlopen(f"{neg_a_base}/xiaozhi/ota/?token={caddy_q_sentinel}", timeout=5) as r_neg_a:
+            assert r_neg_a.status == 200
+        assert len(neg_a_hits) == 1, "Caddy negative control A failed to show multi-key AND bypass"
+    finally:
+        neg_a_srv.shutdown()
+        neg_a_srv.server_close()
+
+    # Caddy negative control B: without `route { ... }`, Caddyfile directive sorting places `handle` before `respond`,
+    # letting /xiaozhi/ota/?token=... reach upstream before `respond @credential_query 400`.
+    caddy_no_route = _caddy_strip_route_wrapper(caddy_text)
+    neg_b_srv, neg_b_base, neg_b_hits, _, _ = _drive_caddy_model(caddy_no_route)
+    try:
+        with urllib.request.urlopen(f"{neg_b_base}/xiaozhi/ota/?token={caddy_q_sentinel}", timeout=5) as r_neg_b:
+            assert r_neg_b.status == 200
+        assert len(neg_b_hits) == 1, "Caddy negative control B failed to show handle-before-respond ordering bypass"
+    finally:
+        neg_b_srv.shutdown()
+        neg_b_srv.server_close()
 
     print("[PASS] blocker #2: Nginx/Caddy templates validated and proxy OTA forwarding logs zero secrets")
 
@@ -2365,6 +2689,316 @@ def _caddy_emit(sinks: list[dict], logger: str, entry: dict) -> None:
                 elif action == "delete":
                     node.pop(path[-1])
         sink["lines"].append(json.dumps(data))
+
+
+_CADDY_DIRECTIVE_ORDER = {
+    "log_skip": 10,
+    "request_body": 20,
+    "rewrite": 30,
+    "handle": 40,
+    "route": 50,
+    "respond": 60,
+    "reverse_proxy": 70,
+}
+
+
+def _caddy_site_access_sink(caddy_text: str) -> dict:
+    """Extract the site-level `log { format filter ... }` sink from a Caddyfile."""
+    blocks = _caddy_parse_blocks(caddy_text)
+    assert blocks, "Empty Caddyfile"
+    site_block = blocks[1] if blocks[0]["tokens"] == [] else blocks[0]
+    fields: list[list[str]] = []
+    for child in site_block["children"] or []:
+        if child["tokens"][:1] != ["log"]:
+            continue
+        for directive in child["children"] or []:
+            if directive["tokens"][:2] == ["format", "filter"]:
+                for sub in directive["children"] or []:
+                    if sub["tokens"] == ["fields"]:
+                        fields.extend(f["tokens"] for f in sub["children"] or [])
+                    elif sub["tokens"][0] != "wrap":
+                        fields.append(sub["tokens"])
+    return {"name": "site_access", "include": ["http.log.access"], "exclude": [], "fields": fields, "lines": []}
+
+
+def _caddy_adapt_site(caddy_text: str) -> dict:
+    """In-process Caddyfile adapter model (NOT real `caddy adapt`): parses matchers and applies directive/sortRoutes order."""
+    blocks = _caddy_parse_blocks(caddy_text)
+    assert blocks, "Empty Caddyfile"
+    site_block = blocks[1] if blocks[0]["tokens"] == [] else blocks[0]
+    matchers: dict[str, list[dict]] = {}
+    raw_directives: list[dict] = []
+
+    def _compile_submatcher(m_name: str, sub_toks: list[str]) -> dict:
+        kind = sub_toks[0]
+        args = sub_toks[1:]
+        if kind == "query":
+            params: dict[str, list[str]] = {}
+            for kv in args:
+                assert "=" in kv, f"Malformed Caddy query matcher arg: {kv!r}"
+                k, v = kv.split("=", 1)
+                params.setdefault(k, []).append(v)
+            return {"kind": "query", "params": params}
+        if kind == "vars_regexp":
+            if len(args) == 2:
+                re_name, field, pattern = m_name[1:], args[0], args[1]
+            elif len(args) == 3:
+                re_name, field, pattern = args[0], args[1], args[2]
+            else:
+                raise AssertionError(f"Unsupported vars_regexp syntax: {sub_toks}")
+            for bad_re2 in ("(?=", "(?!", "(?<=", "(?<!", "\\1"):
+                assert bad_re2 not in pattern, f"Unsupported RE2 construct {bad_re2!r} in {pattern!r}"
+            return {"kind": "vars_regexp", "name": re_name, "field": field, "regex": re.compile(pattern)}
+        if kind == "path":
+            return {"kind": "path", "patterns": list(args)}
+        if kind == "path_regexp":
+            if len(args) == 1:
+                re_name, pattern = m_name[1:], args[0]
+            elif len(args) == 2:
+                re_name, pattern = args[0], args[1]
+            else:
+                raise AssertionError(f"Unsupported path_regexp syntax: {sub_toks}")
+            return {"kind": "path_regexp", "name": re_name, "regex": re.compile(pattern)}
+        raise AssertionError(f"Unsupported Caddy matcher type: {sub_toks}")
+
+    for child in site_block["children"] or []:
+        toks = child["tokens"]
+        if toks[0].startswith("@"):
+            m_name = toks[0]
+            if child["children"] is not None:
+                subs = [_compile_submatcher(m_name, sub["tokens"]) for sub in child["children"]]
+            else:
+                assert len(toks) > 1, f"Empty inline Caddy matcher: {toks}"
+                subs = [_compile_submatcher(m_name, toks[1:])]
+            matchers[m_name] = subs
+        elif toks[0] != "log":
+            raw_directives.append(child)
+
+    def _matcher_sort_key(node: dict) -> tuple[int, int]:
+        toks = node["tokens"]
+        if toks[0] in ("handle", "respond", "log_skip", "rewrite") and len(toks) > 1:
+            mref = toks[1]
+            if mref.startswith("/"):
+                return (0, -len(mref))
+            if mref.startswith("@"):
+                subs = matchers.get(mref, [])
+                if len(subs) == 1 and subs[0]["kind"] == "path" and len(subs[0]["patterns"]) == 1:
+                    return (0, -len(subs[0]["patterns"][0]))
+                return (1, 0)
+        return (2, 0)
+
+    def _adapt_nodes(nodes: list[dict], *, inside_route: bool) -> list[dict]:
+        adapted: list[dict] = []
+        for node in nodes:
+            cmd = node["tokens"][0]
+            children = node["children"]
+            if children is not None and cmd in ("route", "handle"):
+                new_children = _adapt_nodes(children, inside_route=(cmd == "route"))
+            else:
+                new_children = children
+            adapted.append({"tokens": list(node["tokens"]), "children": new_children})
+        if inside_route:
+            return adapted
+        return sorted(
+            adapted,
+            key=lambda n: (_CADDY_DIRECTIVE_ORDER.get(n["tokens"][0], 999), _matcher_sort_key(n)),
+        )
+
+    return {"matchers": matchers, "routes": _adapt_nodes(raw_directives, inside_route=False)}
+
+
+def _caddy_path_match(pattern: str, norm_path: str) -> bool:
+    regex = "^" + re.escape(pattern).replace(r"\*", ".*") + "$"
+    return re.match(regex, norm_path) is not None
+
+
+def _caddy_eval_matcher(matcher_ref: Optional[str], matchers: dict[str, list[dict]], req_state: dict) -> bool:
+    if matcher_ref is None:
+        return True
+    if matcher_ref.startswith("/"):
+        return _caddy_path_match(matcher_ref, req_state["norm_path"])
+    assert matcher_ref in matchers, f"Unknown Caddy matcher reference: {matcher_ref}"
+    for sub in matchers[matcher_ref]:
+        kind = sub["kind"]
+        if kind == "query":
+            # Official Caddy `query` matcher: distinct keys are AND'd; values per key are OR'd.
+            qs = parse_qs(req_state["raw_query"], keep_blank_values=True)
+            for k, patterns in sub["params"].items():
+                if k not in qs:
+                    return False
+                if not any(
+                    re.fullmatch(re.escape(p).replace(r"\*", ".*"), val)
+                    for val in qs[k]
+                    for p in patterns
+                ):
+                    return False
+        elif kind == "vars_regexp":
+            field = sub["field"]
+            if field in ("{query}", "{http.request.uri.query}"):
+                val = req_state["raw_query"]
+            elif field in ("{uri}", "{http.request.uri}"):
+                val = req_state["raw_uri"]
+            elif field in ("{path}", "{http.request.uri.path}"):
+                val = req_state["norm_path"]
+            else:
+                raise AssertionError(f"Unsupported vars_regexp field: {field}")
+            m = sub["regex"].search(val)
+            if not m:
+                return False
+            req_state["re_groups"][sub["name"]] = m
+        elif kind == "path":
+            if not any(_caddy_path_match(p, req_state["norm_path"]) for p in sub["patterns"]):
+                return False
+        elif kind == "path_regexp":
+            m = sub["regex"].search(req_state["norm_path"])
+            if not m:
+                return False
+            req_state["re_groups"][sub["name"]] = m
+        else:
+            raise AssertionError(f"Unsupported Caddy submatcher kind: {kind}")
+    return True
+
+
+def _caddy_execute_routes(
+    adapted: dict,
+    *,
+    method: str,
+    raw_target: str,
+    headers: dict[str, str],
+    body: bytes,
+    upstream_fn,
+    sinks: list[dict],
+    access_sink: Optional[dict] = None,
+) -> tuple[int, bytes, str]:
+    """Execute adapted Caddy routes (in-process router model; NOT real Caddy)."""
+    parsed = urlsplit(raw_target)
+    norm_path = _nginx_normalize_uri(parsed.path)
+    raw_query = parsed.query
+
+    def _canon_hdr(name: str) -> str:
+        return "-".join(part.capitalize() for part in name.split("-"))
+
+    original_request = {
+        "remote_ip": "127.0.0.1",
+        "method": method,
+        "host": headers.get("Host", ""),
+        "uri": raw_target,
+        "headers": {_canon_hdr(k): [v] for k, v in headers.items()},
+    }
+    req_state = {
+        "raw_uri": raw_target,
+        "norm_path": norm_path,
+        "raw_query": raw_query,
+        "headers": dict(headers),
+        "re_groups": {},
+        "log_skip": False,
+        "original_request": original_request,
+    }
+
+    def _exec_nodes(nodes: list[dict]) -> Optional[tuple[int, bytes, str]]:
+        handle_matched = False
+        for node in nodes:
+            toks = node["tokens"]
+            cmd = toks[0]
+            if cmd == "log_skip":
+                mref = toks[1] if len(toks) > 1 else None
+                if _caddy_eval_matcher(mref, adapted["matchers"], req_state):
+                    req_state["log_skip"] = True
+            elif cmd == "respond":
+                if len(toks) >= 3 and (toks[1].startswith("@") or toks[1].startswith("/")):
+                    mref, status = toks[1], int(toks[-1])
+                else:
+                    mref, status = None, int(toks[-1])
+                if _caddy_eval_matcher(mref, adapted["matchers"], req_state):
+                    return status, b"{}", "application/json"
+            elif cmd == "rewrite":
+                mref = toks[1]
+                new_target = toks[2]
+                if mref == "*" or _caddy_eval_matcher(mref, adapted["matchers"], req_state):
+                    req_state["norm_path"] = new_target
+            elif cmd == "request_body":
+                pass
+            elif cmd == "route":
+                res = _exec_nodes(node["children"] or [])
+                if res is not None:
+                    return res
+            elif cmd == "handle":
+                if handle_matched:
+                    continue
+                mref = toks[1] if len(toks) > 1 else None
+                if _caddy_eval_matcher(mref, adapted["matchers"], req_state):
+                    handle_matched = True
+                    res = _exec_nodes(node["children"] or [])
+                    if res is not None:
+                        return res
+            elif cmd == "reverse_proxy":
+                target_upstream = toks[1]
+                fwd_headers = {
+                    k: v
+                    for k, v in req_state["headers"].items()
+                    if k.lower() not in ("host", "content-length", "connection")
+                }
+                for child in node["children"] or []:
+                    ctoks = child["tokens"]
+                    if ctoks[:1] == ["header_up"] and len(ctoks) >= 2:
+                        h_arg = ctoks[1]
+                        if h_arg.startswith("-"):
+                            drop = h_arg[1:].lower()
+                            for existing in [k for k in fwd_headers if k.lower() == drop]:
+                                fwd_headers.pop(existing, None)
+                        elif len(ctoks) >= 3:
+                            def _sub_re(match_obj):
+                                rm = req_state["re_groups"].get(match_obj.group(1))
+                                if rm is None:
+                                    return ""
+                                grp = match_obj.group(2)
+                                return rm.group(int(grp)) if grp.isdigit() else rm.group(grp)
+
+                            val = re.sub(r"\{re\.([^.}]+)\.([^}]+)\}", _sub_re, ctoks[2])
+                            for existing in [k for k in fwd_headers if k.lower() == h_arg.lower()]:
+                                fwd_headers.pop(existing, None)
+                            fwd_headers[h_arg] = val
+                return upstream_fn(method, target_upstream, req_state["norm_path"], req_state["raw_query"], fwd_headers, body)
+            else:
+                raise AssertionError(f"Unsupported Caddy directive in model: {toks}")
+        return None
+
+    res = _exec_nodes(adapted["routes"])
+    if res is None:
+        res = (200, b"", "text/plain")
+    status, resp_body, ctype = res
+    if access_sink is not None and not req_state["log_skip"]:
+        _caddy_emit([access_sink], "http.log.access.log0", {"request": original_request, "status": status})
+    return status, resp_body, ctype
+
+
+def _caddy_with_legacy_and_query(caddy_text: str) -> str:
+    """Mutant for negative control A: restore old multi-key `query` matcher (AND across keys)."""
+    legacy_matcher = (
+        "    @credential_query {\n"
+        "        query authorization=* token=* access_token=* refresh_token=* id_token=* "
+        "secret=* ota_secret=* key=* api_key=* apikey=* password=* sig=* signature=* auth=*\n"
+        "    }"
+    )
+    mutated = re.sub(
+        r"    @credential_query \{.*?\n    \}",
+        lambda _m: legacy_matcher,
+        caddy_text,
+        count=1,
+        flags=re.DOTALL,
+    )
+    assert mutated != caddy_text, "Failed to inject legacy AND query matcher"
+    return mutated
+
+
+def _caddy_strip_route_wrapper(caddy_text: str) -> str:
+    """Mutant for negative control B: unwrap `route { ... }` so Caddyfile sorts `handle` ahead of `respond`."""
+    m = re.search(r"\n    route \{\n(.*?)\n    \}\n\}", caddy_text, re.DOTALL)
+    assert m, "Failed to locate `route { ... }` block in Caddyfile.example"
+    dedented = "\n".join(line[4:] if line.startswith("    ") else line for line in m.group(1).splitlines())
+    mutated = caddy_text[: m.start()] + "\n" + dedented + "\n}" + caddy_text[m.end() :]
+    assert mutated != caddy_text
+    return mutated
 
 
 def _nginx_server_guards(nginx_text: str) -> list[tuple[str, int]]:
@@ -2509,6 +3143,7 @@ def test_proxy_runtime_error_logs_redacted() -> None:
 
     def _make_handler(flavor: str, template: str, sinks, *, access_log_write_fail: bool = False):
         guards = _nginx_server_guards(template) if flavor == "nginx" else []
+        caddy_adapted = _caddy_adapt_site(template) if flavor == "caddy" else None
         site_err_m = re.search(r"^    error_log\s+(\S+)\s+(\w+);", template, re.MULTILINE) if flavor == "nginx" else None
         site_acc_m = (
             re.search(r"^    access_log\s+(\S+)\s+(\w+)(?:\s+if=\$(\w+))?;", template, re.MULTILINE)
@@ -2621,34 +3256,50 @@ def test_proxy_runtime_error_logs_redacted() -> None:
                     )
                     self._reply(502)
                     return
-                # Caddy: original request is captured before `rewrite` for error logs.
+                # Caddy: original request is captured before `rewrite` for error logs, and
+                # adapted route ordering ensures `@credential_query` returns 400 before proxy.
                 original_request = {
                     "remote_ip": "127.0.0.1",
                     "method": self.command,
                     "host": self.headers.get("Host", ""),
                     "uri": self.path,
-                    "headers": {k: [v] for k, v in self.headers.items()},
-                }
-                if caddy_secret_re.match(norm_path):
-                    pass  # rewrite * /xiaozhi/ota/ happens on a copy; logs keep original
-                if not _upstream_fails():
-                    raise AssertionError("dead upstream port unexpectedly accepted")
-                _caddy_emit(
-                    sinks,
-                    "http.handlers.reverse_proxy",
-                    {"level": "error", "msg": "aborting with incomplete response", "request": original_request},
-                )
-                _caddy_emit(
-                    sinks,
-                    "http.log.error.log0",
-                    {
-                        "level": "error",
-                        "msg": f"dial tcp 127.0.0.1:{dead_port}: connect: connection refused",
-                        "request": original_request,
-                        "status": 502,
+                    "headers": {
+                        "-".join(p.capitalize() for p in k.split("-")): [v]
+                        for k, v in self.headers.items()
                     },
+                }
+
+                def _dead_caddy_upstream(_m, _up, _tp, _rq, _fh, _bd):
+                    if not _upstream_fails():
+                        raise AssertionError("dead upstream port unexpectedly accepted")
+                    _caddy_emit(
+                        sinks,
+                        "http.handlers.reverse_proxy",
+                        {"level": "error", "msg": "aborting with incomplete response", "request": original_request},
+                    )
+                    _caddy_emit(
+                        sinks,
+                        "http.log.error.log0",
+                        {
+                            "level": "error",
+                            "msg": f"dial tcp 127.0.0.1:{dead_port}: connect: connection refused",
+                            "request": original_request,
+                            "status": 502,
+                        },
+                    )
+                    return 502, b"{}", "application/json"
+
+                assert caddy_adapted is not None
+                status, _, _ = _caddy_execute_routes(
+                    caddy_adapted,
+                    method=self.command,
+                    raw_target=self.path,
+                    headers={k: v for k, v in self.headers.items()},
+                    body=b"{}",
+                    upstream_fn=_dead_caddy_upstream,
+                    sinks=sinks,
                 )
-                self._reply(502)
+                self._reply(status)
 
             def do_GET(self):
                 self._handle()
@@ -2707,17 +3358,24 @@ def test_proxy_runtime_error_logs_redacted() -> None:
         assert _nginx_normalize_uri(urlsplit(eq_url).path) == f"/xiaozhi/ota/d/{syn}/", eq_url
     assert _nginx_normalize_uri(urlsplit(encoded_letter_mixed).path).lower() == f"/xiaozhi/ota/d/{syn}/".lower()
 
-    # --- Caddy: 502 backend failure on secret route and normal route ---
+    # --- Caddy: 502 backend failure on secret/normal routes & 400 pre-proxy query guard ---
     caddy_sinks = _caddy_log_sinks(caddy_text)
     caddy_status = _drive(
         "caddy",
         caddy_text,
         caddy_sinks,
-        [("POST", f"/xiaozhi/ota/d/{syn}/", secret_ref), ("POST", "/xiaozhi/ota/", secret_ref)],
+        [
+            ("POST", f"/xiaozhi/ota/d/{syn}/", secret_ref),
+            ("POST", "/xiaozhi/ota/", secret_ref),
+            ("POST", f"/xiaozhi/ota/?token={syn}", secret_ref),
+            ("POST", f"/xiaozhi/ota/d/{syn}/?token={syn}", secret_ref),
+        ],
     )
-    assert caddy_status == [502, 502], caddy_status
+    assert caddy_status == [502, 502, 400, 400], caddy_status
     err_sink = [s for s in caddy_sinks if "http.log.error" in s["include"]]
-    assert err_sink and len(err_sink[0]["lines"]) >= 4, "Caddy runtime error sink did not receive failure entries"
+    assert err_sink and len(err_sink[0]["lines"]) == 4, (
+        f"Caddy runtime error sink expected 4 entries from the two 502s, got: {len(err_sink[0]['lines']) if err_sink else 0}"
+    )
     assert any('"[REDACTED]"' in line for line in err_sink[0]["lines"])
     default_sink = [s for s in caddy_sinks if s["name"] == "default"][0]
     assert not any("http.log.error" in line or "reverse_proxy" in line for line in default_sink["lines"])
@@ -2731,9 +3389,10 @@ def test_proxy_runtime_error_logs_redacted() -> None:
     _drive("caddy", caddy_no_global, ctrl_sinks, [("POST", f"/xiaozhi/ota/d/{syn}/", None)])
     assert any(syn in line for s in ctrl_sinks for line in s["lines"]), "Caddy negative control failed to detect leak"
 
-    # --- Nginx: site error log and access log across literal & equivalent percent-encoded Referers ---
+    # --- Nginx: site error log and access log across literal & equivalent percent-encoded Referers & query creds ---
     guards = _nginx_server_guards(nginx_text)
     assert ("$passport_unsafe_referer", 400) in guards, f"Missing server-level Referer guard: {guards}"
+    assert ("$passport_credential_query", 400) in guards, f"Missing server-level query guard: {guards}"
     site_err = re.search(r"^    error_log\s+(\S+)\s+(\w+);", nginx_text, re.MULTILINE)
     assert site_err and site_err.group(1) != "/dev/null", "site error_log must remain a real diagnostic log"
     nginx_logs: dict[str, list[str]] = {"err": [], "access": []}
@@ -2754,25 +3413,28 @@ def test_proxy_runtime_error_logs_redacted() -> None:
             ("POST", "/mcp/vision/explain", f"https://u:{syn}@passport.example/"),
             ("POST", "/xiaozhi/ota/", f"https://passport.example/?token={syn}"),
             ("POST", "/xiaozhi/ota/", "https://passport.example/docs"),
+            ("POST", f"/xiaozhi/ota/?token={syn}", "https://passport.example/"),
+            ("GET", f"/xiaozhi/v1/?api_key={syn}", "https://passport.example/"),
             ("POST", "/xiaozhi/ota/", "https://passport.example/"),
             ("POST", f"/xiaozhi/ota/d/{syn}/", None),
             ("POST", f"/%78iaozhi/%6fta/%64/{syn}/", None),
             ("POST", f"/%78iaozhi/%6fta/%64/{syn}/", encoded_letter_3),
         ],
     )
-    assert nginx_status == [400] * 12 + [502, 502, 502, 400], nginx_status
+    assert nginx_status == [400] * 14 + [502, 502, 502, 400], nginx_status
     assert len(nginx_logs["err"]) == 1 and 'referrer: "https://passport.example/"' in nginx_logs["err"][0], (
         f"nginx stand-in error_log unexpected: {nginx_logs['err']}"
     )
     assert len(nginx_logs["access"]) == 1 and " 502 " in nginx_logs["access"][0], (
-        f"expected 1 safe access log entry (unsafe-Referer 400s & secret paths skipped), got {nginx_logs['access']}"
+        f"expected 1 safe access log entry (400s & secret paths skipped), got {nginx_logs['access']}"
     )
     assert not any(syn in line for line in nginx_logs["err"] + nginx_logs["access"]), (
         "nginx template-driven stand-in leaked OTA secret into error_log or access_log"
     )
 
-    # Access-log write failure simulation: unsafe-Referer 400s & server-level secret-URI query rejections skip access_log,
-    # so neither error_log `[alert]` nor access_log captures raw Referer or secret URI.
+    # Access-log write failure simulation: unsafe-Referer 400s, credential-query 400s on normal routes,
+    # and server-level secret-URI query rejections all skip access_log, so neither error_log `[alert]`
+    # nor access_log captures raw Referer, raw query secret, or secret URI.
     fail_logs: dict[str, list[str]] = {"err": [], "access": []}
     fail_status = _drive(
         "nginx",
@@ -2791,6 +3453,8 @@ def test_proxy_runtime_error_logs_redacted() -> None:
             ("POST", "/mcp/vision/explain", f"https://u:{syn}@passport.example/"),
             ("POST", "/xiaozhi/ota/", f"https://passport.example/?token={syn}"),
             ("POST", "/xiaozhi/ota/", "https://passport.example/docs"),
+            ("POST", f"/xiaozhi/ota/?token={syn}", "https://passport.example/"),
+            ("GET", f"/xiaozhi/v1/?api_key={syn}", "https://passport.example/"),
             ("POST", "/xiaozhi/ota/", "https://passport.example/"),
             ("POST", f"/xiaozhi/ota/d/{syn}/", None),
             ("POST", f"/%78iaozhi/%6fta/%64/{syn}/", None),
@@ -2799,7 +3463,7 @@ def test_proxy_runtime_error_logs_redacted() -> None:
         ],
         access_log_write_fail=True,
     )
-    assert fail_status == [400] * 12 + [502, 502, 502, 400, 400], fail_status
+    assert fail_status == [400] * 14 + [502, 502, 502, 400, 400], fail_status
     assert fail_logs["access"] == []
     assert len(fail_logs["err"]) == 2 and all('referrer: "https://passport.example/"' in ln for ln in fail_logs["err"]), (
         f"unexpected fail_logs err: {fail_logs['err']}"
@@ -2854,7 +3518,7 @@ def test_proxy_runtime_error_logs_redacted() -> None:
     assert any(syn in line for line in ctrl_logs["err"]), "nginx guard-removal negative control failed to detect error_log leak"
     assert not any(syn in line for line in ctrl_logs["access"]), "access_log should remain redacted even without guard"
 
-    # Negative control 3: stripping `if=$passport_log_access` under access_log write failure leaks raw Referer via [alert].
+    # Negative control 3: stripping `if=$passport_log_access` under access_log write failure leaks raw Referer & raw query via [alert].
     nginx_uncond_acc = nginx_text.replace(" if=$passport_log_access", "")
     assert nginx_uncond_acc != nginx_text
     uncond_logs: dict[str, list[str]] = {"err": [], "access": []}
@@ -2866,11 +3530,12 @@ def test_proxy_runtime_error_logs_redacted() -> None:
             ("POST", "/xiaozhi/ota/", secret_ref),
             ("POST", "/xiaozhi/ota/", encoded_letter_3),
             ("POST", f"/xiaozhi/ota/d/{syn}/?token={syn}", None),
+            ("POST", f"/xiaozhi/ota/?token={syn}", "https://passport.example/"),
         ],
         access_log_write_fail=True,
     )
-    assert uncond_status == [400, 400, 400]
-    assert len(uncond_logs["err"]) == 3 and all(syn in line and "[alert]" in line for line in uncond_logs["err"]), (
+    assert uncond_status == [400, 400, 400, 400]
+    assert len(uncond_logs["err"]) == 4 and all(syn in line and "[alert]" in line for line in uncond_logs["err"]), (
         f"unconditional access_log negative control failed to detect [alert] leak: {uncond_logs['err']}"
     )
     print(
@@ -2949,6 +3614,7 @@ def test_real_nginx_log_isolation(ota_base: str, dev_a: dict) -> set[str]:
     dead_port = _free_port()
     syn = "realnginx_ota_" + secrets.token_hex(12)
     q_syn = "realnginx_q_" + secrets.token_hex(10)
+    benign_q = "realnginx_benign_" + secrets.token_hex(8)
     issued_tokens: set[str] = set()
 
     def _raw_http(port: int, method: str, path: str, *, headers: Optional[dict[str, str]] = None, body: Optional[bytes] = None) -> tuple[int, bytes]:
@@ -3018,9 +3684,13 @@ def test_real_nginx_log_isolation(ota_base: str, dev_a: dict) -> set[str]:
                     False,
                 ),
                 ("fixed_secret_q", "POST", f"/xiaozhi/ota/d/{syn}/?token={q_syn}", None, 400, False),
+                ("fixed_ota_q_ref", "POST", f"/xiaozhi/ota/?token={q_syn}", "https://passport.example/", 400, False),
+                ("fixed_ota_q_noref", "GET", f"/xiaozhi/ota/?api_key={q_syn}", None, 400, False),
+                ("fixed_ws_q_ref", "GET", f"/xiaozhi/v1/?foo=1&Authorization={q_syn}", "https://passport.example/", 400, False),
                 ("fixed_safe_pos", "GET", "/xiaozhi/ota/", "https://passport.example/", 200, False),
                 ("neg_uncond_lit", "POST", "/xiaozhi/ota/", f"https://passport.example/xiaozhi/ota/d/{syn}/", 400, True),
                 ("neg_uncond_enc", "POST", "/xiaozhi/ota/", f"https://passport.example/%78iaozhi/%6fta/%64/{syn}/", 400, True),
+                ("neg_uncond_ota_q", "POST", f"/xiaozhi/ota/?token={q_syn}", "https://passport.example/", 400, True),
             ]
             for label, method, path, ref, exp_code, strip_if in full_cases:
                 fp = _free_port()
@@ -3099,14 +3769,35 @@ def test_real_nginx_log_isolation(ota_base: str, dev_a: dict) -> set[str]:
 
             st_get, _ = _raw_http(p_live, "GET", "/xiaozhi/ota/")
             assert st_get == 200, st_get
-            st_q, _ = _raw_http(
+            st_get_benign, _ = _raw_http(p_live, "GET", f"/xiaozhi/ota/?probe={benign_q}")
+            assert st_get_benign == 200, st_get_benign
+            for q_headers in (
+                {"Content-Type": "application/json"},
+                {"Content-Type": "application/json", "Referer": "https://passport.example/"},
+            ):
+                st_q, _ = _raw_http(
+                    p_live,
+                    "POST",
+                    f"/xiaozhi/ota/?token={q_syn}",
+                    headers=q_headers,
+                    body=b"{}",
+                )
+                assert st_q == 400, st_q
+            st_ws_q, _ = _raw_http(
+                p_live,
+                "GET",
+                f"/xiaozhi/v1/?foo=1&API_KEY={q_syn}",
+                headers={"Referer": "https://passport.example/"},
+            )
+            assert st_ws_q == 400, st_ws_q
+            st_vis_q, _ = _raw_http(
                 p_live,
                 "POST",
-                f"/xiaozhi/ota/?token={q_syn}",
-                headers={"Content-Type": "application/json"},
+                f"/mcp/vision/explain?secret={q_syn}",
+                headers={"Content-Type": "application/json", "Referer": "https://passport.example/"},
                 body=b"{}",
             )
-            assert st_q == 400, st_q
+            assert st_vis_q == 400, st_vis_q
 
             unsafe_referers = [
                 f"https://passport.example/xiaozhi/ota/d/{syn}/",
@@ -3133,7 +3824,7 @@ def test_real_nginx_log_isolation(ota_base: str, dev_a: dict) -> set[str]:
             st_ws_ref, _ = _raw_http(p_live, "GET", "/xiaozhi/v1/", headers={"Referer": unsafe_referers[3]})
             assert st_ws_ref == 400, st_ws_ref
 
-            # Scenario 2: Dead upstream (502) & unsafe Referer rejections.
+            # Scenario 2: Dead upstream (502), unsafe Referer rejections, and query-credential rejections.
             for bad_ref in unsafe_referers:
                 st_d_ref, _ = _raw_http(
                     p_dead,
@@ -3143,6 +3834,14 @@ def test_real_nginx_log_isolation(ota_base: str, dev_a: dict) -> set[str]:
                     body=b"{}",
                 )
                 assert st_d_ref == 400, st_d_ref
+            st_d_q, _ = _raw_http(
+                p_dead,
+                "POST",
+                f"/xiaozhi/ota/?token={q_syn}",
+                headers={"Content-Type": "application/json", "Referer": "https://passport.example/"},
+                body=b"{}",
+            )
+            assert st_d_q == 400, st_d_q
             st_502_safe, _ = _raw_http(
                 p_dead,
                 "POST",
@@ -3169,6 +3868,7 @@ def test_real_nginx_log_isolation(ota_base: str, dev_a: dict) -> set[str]:
                 _wait_for_log_substring([tmp / "full_fixed_safe_pos.log"], "[alert]")
                 _wait_for_log_substring([tmp / "full_neg_uncond_lit.log"], "[alert]")
                 _wait_for_log_substring([tmp / "full_neg_uncond_enc.log"], "[alert]")
+                _wait_for_log_substring([tmp / "full_neg_uncond_ota_q.log"], "[alert]")
             time.sleep(0.15)
 
             live_acc_lines = [ln for ln in live_acc.read_text(encoding="utf-8", errors="replace").splitlines() if ln.strip()]
@@ -3180,7 +3880,7 @@ def test_real_nginx_log_isolation(ota_base: str, dev_a: dict) -> set[str]:
             assert len(live_acc_lines) == 2, f"Unexpected real nginx live_access.log lines: {live_acc_lines}"
             assert all('"-"' in ln for ln in live_acc_lines), live_acc_lines
             assert '"GET /xiaozhi/ota/ HTTP/1.1" 200' in live_acc_lines[0]
-            assert '"POST /xiaozhi/ota/?[REDACTED] HTTP/1.1" 400' in live_acc_lines[1]
+            assert '"GET /xiaozhi/ota/?[REDACTED] HTTP/1.1" 200' in live_acc_lines[1]
             assert live_err_txt == "", f"Expected empty live_error.log, got: {redact_text(live_err_txt)}"
 
             assert len(dead_acc_lines) == 1 and '"POST /xiaozhi/ota/ HTTP/1.1" 502' in dead_acc_lines[0], dead_acc_lines
@@ -3204,13 +3904,17 @@ def test_real_nginx_log_isolation(ota_base: str, dev_a: dict) -> set[str]:
                         assert "[alert]" in ftxt and 'write() to "/dev/full" failed' in ftxt
                         assert 'referrer: "https://passport.example/"' in ftxt
                     else:
-                        assert ftxt == "", f"/dev/full case {label} unexpectedly wrote to error_log: {ftxt.replace(syn, '[REDACTED]')}"
+                        assert ftxt == "", (
+                            f"/dev/full case {label} unexpectedly wrote to error_log: "
+                            f"{ftxt.replace(syn, '[REDACTED]').replace(q_syn, '[REDACTED]')}"
+                        )
                 else:
-                    assert "[alert]" in ftxt and 'write() to "/dev/full" failed' in ftxt and syn in ftxt, (
-                        f"Real nginx negative control {label} failed to reproduce [alert] Referer leak"
+                    expected_leak = q_syn if label == "neg_uncond_ota_q" else syn
+                    assert "[alert]" in ftxt and 'write() to "/dev/full" failed' in ftxt and expected_leak in ftxt, (
+                        f"Real nginx negative control {label} failed to reproduce [alert] leak"
                     )
 
-            forbidden_all = {syn, q_syn, dev_a["ota_secret"], *issued_tokens}
+            forbidden_all = {syn, q_syn, benign_q, dev_a["ota_secret"], *issued_tokens}
             joined_fixed = "\n".join(all_fixed_logs)
             for secret_val in forbidden_all:
                 assert secret_val not in joined_fixed, "Real nginx log leaked secret!"
@@ -3221,8 +3925,120 @@ def test_real_nginx_log_isolation(ota_base: str, dev_a: dict) -> set[str]:
 
     print(
         f"[PASS] real {nginx_ver} (loopback 127.0.0.1, nginx -t rc=0): normal reject/forward, "
-        f"502 upstream failure, and /dev/full={has_dev_full} access_log failure + negative controls passed with zero secret leaks"
+        f"502 upstream failure, and /dev/full={has_dev_full} access_log failure (Referer + normal-route query) "
+        f"+ negative controls passed with zero secret leaks"
     )
+    return issued_tokens
+
+
+def _find_caddy_binary() -> Optional[Path]:
+    """Locate an installed or user-space caddy binary without altering system state."""
+    candidates: list[Path] = []
+    if os.environ.get("PASSPORT_CADDY_BIN"):
+        candidates.append(Path(os.environ["PASSPORT_CADDY_BIN"]))
+    which_caddy = shutil.which("caddy")
+    if which_caddy:
+        candidates.append(Path(which_caddy))
+    candidates.extend(
+        [
+            Path.home() / ".local" / "bin" / "caddy",
+            Path("/usr/local/bin/caddy"),
+            Path("/usr/bin/caddy"),
+            Path("/tmp/passport-caddy/caddy"),
+        ]
+    )
+    for cand in candidates:
+        if cand.is_file() and os.access(cand, os.X_OK):
+            return cand
+    return None
+
+
+def test_real_caddy_adapt_and_routing(ota_base: str, dev_a: dict) -> set[str]:
+    """Run real `caddy adapt` and loopback `caddy run` acceptance when a Caddy binary is available."""
+    caddy_bin = _find_caddy_binary()
+    if caddy_bin is None:
+        print(
+            "[INFO] real caddy binary unavailable on host/user-space; skipping real Caddy acceptance "
+            "(in-process Caddyfile adapter/router model is NOT real Caddy acceptance)"
+        )
+        return set()
+
+    ver_res = subprocess.run([str(caddy_bin), "version"], capture_output=True, text=True)
+    caddy_ver = (ver_res.stdout or ver_res.stderr).strip()
+    caddy_text = (ROOT / "proxy" / "Caddyfile.example").read_text(encoding="utf-8")
+    live_http_port = urlsplit(ota_base).port
+    assert live_http_port is not None
+    dead_port = _free_port()
+    caddy_port = _free_port()
+    q_syn = "realcaddy_q_" + secrets.token_hex(10)
+    issued_tokens: set[str] = set()
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp = Path(tmpdir)
+        acc_log = tmp / "caddy_access.log"
+        err_log = tmp / "caddy_error.log"
+        adapted_cf = caddy_text.replace("your-passport-host.example.com {", f"http://127.0.0.1:{caddy_port} {{")
+        adapted_cf = adapted_cf.replace("{\n    log default {", "{\n    auto_https off\n    admin off\n    log default {")
+        adapted_cf = adapted_cf.replace("/var/log/caddy/passport_access.log", str(acc_log))
+        adapted_cf = adapted_cf.replace("/var/log/caddy/passport_error.log", str(err_log))
+        adapted_cf = adapted_cf.replace("127.0.0.1:18013", f"127.0.0.1:{live_http_port}")
+        adapted_cf = adapted_cf.replace("127.0.0.1:18010", f"127.0.0.1:{dead_port}")
+        cf_path = tmp / "Caddyfile"
+        cf_path.write_text(adapted_cf, encoding="utf-8")
+
+        adapt_res = subprocess.run(
+            [str(caddy_bin), "adapt", "--config", str(cf_path), "--adapter", "caddyfile"],
+            capture_output=True,
+            text=True,
+        )
+        assert adapt_res.returncode == 0, f"caddy adapt failed ({adapt_res.returncode}):\n{adapt_res.stderr}"
+        adapted_json = json.loads(adapt_res.stdout)
+        routes = adapted_json["apps"]["http"]["servers"]["srv0"]["routes"]
+        assert routes, f"Unexpected empty adapted Caddy routes: {adapted_json}"
+
+        proc = subprocess.Popen(
+            [str(caddy_bin), "run", "--config", str(cf_path), "--adapter", "caddyfile"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            deadline = time.monotonic() + 8.0
+            while time.monotonic() < deadline:
+                if proc.poll() is not None:
+                    raise RuntimeError(f"Real caddy exited prematurely ({proc.returncode}): {proc.stderr.read()}")
+                try:
+                    with socket.create_connection(("127.0.0.1", caddy_port), timeout=0.5):
+                        break
+                except OSError:
+                    time.sleep(0.05)
+
+            caddy_base = f"http://127.0.0.1:{caddy_port}"
+            for qk in sorted(SENSITIVE_QUERY_KEYS):
+                st_cq, _ = post_json(
+                    f"{caddy_base}/xiaozhi/ota/?{qk}={q_syn}",
+                    {"Device-Id": dev_a["device_id"], "Client-Id": dev_a["client_id"]},
+                )
+                assert st_cq == 400, f"Real caddy failed to reject ?{qk}=: {st_cq}"
+            st_ok, body_ok = post_ota(
+                caddy_base,
+                {"Device-Id": dev_a["device_id"], "Client-Id": dev_a["client_id"]},
+                secret=dev_a["ota_secret"],
+            )
+            assert st_ok == 200 and body_ok["websocket"]["token"]
+            issued_tokens.add(body_ok["websocket"]["token"])
+        finally:
+            proc.terminate()
+            proc.wait(timeout=5)
+
+        joined = "\n".join(
+            p.read_text(encoding="utf-8", errors="replace") for p in (acc_log, err_log) if p.is_file()
+        )
+        for secret_val in {q_syn, dev_a["ota_secret"], *issued_tokens}:
+            assert secret_val not in joined, "Real caddy log leaked secret!"
+        assert "/xiaozhi/ota/d/" not in joined, "Real caddy log recorded /xiaozhi/ota/d/!"
+
+    print(f"[PASS] real {caddy_ver} (loopback 127.0.0.1, caddy adapt rc=0): verified query guard & log isolation")
     return issued_tokens
 
 
@@ -4561,6 +5377,7 @@ def main() -> None:
 
             test_reverse_proxy_templates_and_forwarding(ota_base, dev_a)
             nginx_tokens = test_real_nginx_log_isolation(ota_base, dev_a)
+            caddy_tokens = test_real_caddy_adapt_and_routing(ota_base, dev_a)
 
             res = asyncio.run(
                 _run_live_server_regressions(
@@ -4574,6 +5391,7 @@ def main() -> None:
                 )
             )
             res["secrets_to_check"].update(nginx_tokens)
+            res["secrets_to_check"].update(caddy_tokens)
             ttl_secrets = test_real_ttl_expiration(server_home, fake_port)
             res["secrets_to_check"].update(ttl_secrets)
             sigterm_elapsed = _stop_process_gracefully(server_proc, "xiaozhi-server")

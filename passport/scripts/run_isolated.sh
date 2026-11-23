@@ -105,7 +105,7 @@ fi
 if [ -x "$SHARED_VENV/bin/python" ]; then
   SHARED_INFO=$("$SHARED_VENV/bin/python" -c 'import sys, sysconfig; print("%d.%d" % sys.version_info[:2]); print(sysconfig.get_paths()["purelib"])')
   "$DEMO_VENV/bin/python" - "$SHARED_INFO" "$DEMO_VENV" "$RUNTIME" <<'PY'
-import pathlib, sys, sysconfig
+import os, pathlib, sys, sysconfig, tempfile
 shared_ver, shared_site = sys.argv[1].splitlines()[:2]
 demo_venv = pathlib.Path(sys.argv[2]).resolve()
 real_runtime = pathlib.Path(sys.argv[3]).resolve()
@@ -113,11 +113,27 @@ purelib = pathlib.Path(sysconfig.get_paths()["purelib"]).resolve()
 if demo_venv not in purelib.parents or purelib == real_runtime or real_runtime in purelib.parents:
     sys.exit(f"Refusing demo venv purelib outside demo venv: {purelib}")
 target = purelib / "zz_passport_shared_readonly.pth"
-if target.is_symlink():
-    target.unlink()
 if shared_ver == "%d.%d" % sys.version_info[:2]:
-    target.write_text(f"import site; site.addsitedir({shared_site!r})\n", encoding="utf-8")
-elif target.exists():
+    content = f"import site; site.addsitedir({shared_site!r})\n"
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=".zz_passport_shared_readonly.",
+        suffix=".pth.tmp",
+        dir=str(purelib),
+    )
+    try:
+        os.fchmod(fd, 0o644)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_name, target)
+    except BaseException:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
+elif target.is_symlink() or target.exists():
     target.unlink()
 PY
 fi

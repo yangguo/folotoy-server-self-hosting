@@ -16,6 +16,11 @@
 #   the site access-log filter do NOT apply to them. The global options block
 #   below therefore excludes those loggers from the unfiltered default log and
 #   routes them to a dedicated sink with the same field filters.
+# - Credential query guard: `@credential_query` uses `vars_regexp` against
+#   `{query}` (instead of Caddy's `query` matcher, which ANDs distinct keys) so
+#   any single credential parameter matches, and all site directives sit inside
+#   an ordered `route` block so `log_skip` and `respond @credential_query 400`
+#   execute ahead of every `handle` / `reverse_proxy`.
 # - If external APM / OpenTelemetry / WAF instrumentation is attached, disable or
 #   scrub `http.target`, `url.path`, `url.full`, and `http.url` on `/xiaozhi/ota/d/*`.
 
@@ -75,73 +80,76 @@ your-passport-host.example.com {
     }
 
     @credential_query {
-        query authorization=* token=* access_token=* refresh_token=* id_token=* secret=* ota_secret=* key=* api_key=* apikey=* password=* sig=* signature=* auth=*
+        vars_regexp cred_query {query} (?i)(^|&)(authorization|token|access_token|refresh_token|id_token|secret|ota_secret|key|api_key|apikey|password|sig|signature|auth)=
     }
-    respond @credential_query 400
 
     @ota_secret_path {
         path_regexp ota ^/xiaozhi/ota/d/([^/]+)/?$
     }
     @ota_secret_prefix path /xiaozhi/ota/d/*
-    log_skip @ota_secret_prefix
 
-    handle @ota_secret_path {
-        rewrite * /xiaozhi/ota/
-        reverse_proxy 127.0.0.1:18013 {
-            header_up X-OTA-Secret {re.ota.1}
-            header_up -Authorization
-            header_up -X-Original-URI
-            header_up -X-Original-URL
-            header_up -X-Rewrite-URL
-            header_up -X-Forwarded-Uri
-            header_up -X-Envoy-Original-Path
-            header_up -X-Request-URI
-            header_up -Referer
+    route {
+        log_skip @ota_secret_prefix
+        respond @credential_query 400
+
+        handle @ota_secret_path {
+            rewrite * /xiaozhi/ota/
+            reverse_proxy 127.0.0.1:18013 {
+                header_up X-OTA-Secret {re.ota.1}
+                header_up -Authorization
+                header_up -X-Original-URI
+                header_up -X-Original-URL
+                header_up -X-Rewrite-URL
+                header_up -X-Forwarded-Uri
+                header_up -X-Envoy-Original-Path
+                header_up -X-Request-URI
+                header_up -Referer
+            }
         }
-    }
 
-    handle @ota_secret_prefix {
+        handle @ota_secret_prefix {
+            respond 404
+        }
+
+        handle /xiaozhi/ota/* {
+            reverse_proxy 127.0.0.1:18013 {
+                header_up -X-Original-URI
+                header_up -X-Original-URL
+                header_up -X-Rewrite-URL
+                header_up -X-Forwarded-Uri
+                header_up -X-Envoy-Original-Path
+                header_up -X-Request-URI
+                header_up -Referer
+            }
+        }
+
+        handle /mcp/vision/explain {
+            request_body {
+                max_size 6MB
+            }
+            reverse_proxy 127.0.0.1:18013 {
+                header_up -X-Original-URI
+                header_up -X-Original-URL
+                header_up -X-Rewrite-URL
+                header_up -X-Forwarded-Uri
+                header_up -X-Envoy-Original-Path
+                header_up -X-Request-URI
+                header_up -Referer
+            }
+        }
+
+        handle /xiaozhi/v1/* {
+            reverse_proxy 127.0.0.1:18010 {
+                header_up -X-Original-URI
+                header_up -X-Original-URL
+                header_up -X-Rewrite-URL
+                header_up -X-Forwarded-Uri
+                header_up -X-Envoy-Original-Path
+                header_up -X-Request-URI
+                header_up -Referer
+            }
+        }
+
         respond 404
     }
-
-    handle /xiaozhi/ota/* {
-        reverse_proxy 127.0.0.1:18013 {
-            header_up -X-Original-URI
-            header_up -X-Original-URL
-            header_up -X-Rewrite-URL
-            header_up -X-Forwarded-Uri
-            header_up -X-Envoy-Original-Path
-            header_up -X-Request-URI
-            header_up -Referer
-        }
-    }
-
-    handle /mcp/vision/explain {
-        request_body {
-            max_size 6MB
-        }
-        reverse_proxy 127.0.0.1:18013 {
-            header_up -X-Original-URI
-            header_up -X-Original-URL
-            header_up -X-Rewrite-URL
-            header_up -X-Forwarded-Uri
-            header_up -X-Envoy-Original-Path
-            header_up -X-Request-URI
-            header_up -Referer
-        }
-    }
-
-    handle /xiaozhi/v1/* {
-        reverse_proxy 127.0.0.1:18010 {
-            header_up -X-Original-URI
-            header_up -X-Original-URL
-            header_up -X-Rewrite-URL
-            header_up -X-Forwarded-Uri
-            header_up -X-Envoy-Original-Path
-            header_up -X-Request-URI
-            header_up -Referer
-        }
-    }
-
-    respond 404
 }
