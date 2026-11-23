@@ -2,6 +2,7 @@
 
 import fcntl
 import os
+import stat
 import tempfile
 from contextlib import contextmanager
 from pathlib import Path
@@ -13,20 +14,53 @@ def locked_file(path: Path, mode: int = 0o600) -> Iterator[None]:
     """Acquire an exclusive cross-process advisory lock via a sidecar lock file.
 
     Locks ``.<name>.lock`` rather than *path* itself so callers can safely perform
-    ``os.replace`` on *path* without invalidating the locked inode.
+    ``os.replace`` on *path* without invalidating the locked inode. Refuses
+    symlinks and multi-hard-link lock files before any ``fchmod`` or ``flock``
+    so a planted link cannot be altered via the sidecar lock.
     """
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
     lock_path = target.parent / f".{target.name}.lock"
-    fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, mode)
+    flags = os.O_CREAT | os.O_RDWR | getattr(os, "O_CLOEXEC", 0)
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    if hasattr(os, "O_NONBLOCK"):
+        flags |= os.O_NONBLOCK
+    fd = os.open(lock_path, flags, mode)
+    locked = False
     try:
-        os.fchmod(fd, mode)
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise PermissionError(f"Refusing non-regular lock file: {lock_path}")
+        if st.st_uid != os.geteuid():
+            raise PermissionError(f"Refusing lock file owned by another user: {lock_path}")
+        if st.st_nlink != 1:
+            raise PermissionError(
+                f"Refusing lock file with multiple hard links (nlink={st.st_nlink}): {lock_path}"
+            )
+        lst = os.lstat(lock_path)
+        if stat.S_ISLNK(lst.st_mode) or (lst.st_dev, lst.st_ino) != (st.st_dev, st.st_ino):
+            raise PermissionError(f"Refusing replaced or symlinked lock file: {lock_path}")
         fcntl.flock(fd, fcntl.LOCK_EX)
-        try:
-            yield
-        finally:
-            fcntl.flock(fd, fcntl.LOCK_UN)
+        locked = True
+        st_locked = os.fstat(fd)
+        if (
+            not stat.S_ISREG(st_locked.st_mode)
+            or st_locked.st_uid != os.geteuid()
+            or st_locked.st_nlink != 1
+        ):
+            raise PermissionError(
+                f"Refusing lock file whose metadata changed (nlink={st_locked.st_nlink}): {lock_path}"
+            )
+        if stat.S_IMODE(st_locked.st_mode) != mode:
+            os.fchmod(fd, mode)
+        yield
     finally:
+        if locked:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            except OSError:
+                pass
         os.close(fd)
 
 

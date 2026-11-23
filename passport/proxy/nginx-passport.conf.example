@@ -9,27 +9,38 @@
 # Security & log-safety guarantees:
 # - Per-device OTA secret routes (/xiaozhi/ota/d/<secret>/) disable access logs,
 #   redirect error logging to `/dev/null emerg` (never `error_log off;`), reject
-#   credential-bearing query strings, rewrite to /xiaozhi/ota/, pass the secret
-#   in X-OTA-Secret, and strip tracing/URI headers (X-Original-URI, Referer, etc.).
+#   unexpected query strings via `$passport_unsafe_query`, rewrite to
+#   /xiaozhi/ota/, pass the secret in X-OTA-Secret, and strip tracing/URI
+#   headers (X-Original-URI, Referer, etc.).
 # - All other routes use `log_format passport_safe`, which replaces any OTA
 #   secret path segment or query string via `map` and omits Authorization,
 #   X-OTA-Secret, Cookie, raw $request / $request_uri / $args, and any Referer
 #   variable (emitting literal `"-"` for the Referer field).
 # - The site error log (`passport_error.log`) cannot be field-filtered and nginx
-#   appends the raw client Referer to its lines, so a server-level strict
-#   allowlist guard (`$passport_unsafe_referer` -> `return 400`) rejects any
-#   Referer other than absent/empty or a bare HTTP(S) origin (`scheme://host[:port][/]`)
-#   before any location / proxy / body-size error can be logged, blocking literal,
-#   percent-encoded, dot-segment, userinfo, and query-bearing Referers alike.
+#   appends the raw client Referer and raw request line to its lines, so server-
+#   level strict allowlists reject:
+#   1) `$passport_unsafe_referer` -> `return 400`: any Referer other than
+#      absent/empty or a bare HTTP(S) origin (`scheme://host[:port][/]`),
+#      blocking literal, percent-encoded, dot-segment, userinfo, and query-
+#      bearing Referers alike.
+#   2) `$passport_unsafe_query` -> `return 400`: because Nginx's `$args` and
+#      `$arg_*` do not percent-decode query keys (so `?%74oken=...` bypasses a
+#      denylist on raw `$args` or `$arg_*`), this map enforces a strict
+#      route-scoped allowlist on `"$is_args$args|$uri"`: only empty queries or
+#      the exact `/xiaozhi/v1/?from=mqtt_gateway` handshake query are allowed;
+#      all literal, percent-encoded, or unexpected query parameters are rejected
+#      at server level before any location / upstream error can be logged.
 # - In addition, `access_log` uses `if=$passport_log_access` to skip access-log
-#   writes whenever `$passport_unsafe_referer` or `$passport_credential_query`
+#   writes whenever `$passport_unsafe_referer` or `$passport_unsafe_query`
 #   rejects a request (or when a server-level guard rejects a `/xiaozhi/ota/d/`
 #   URI before location matching), preventing an access-log write failure /
-#   short write (`[alert]`) from leaking raw `Referer` or raw credential-bearing
+#   short write (`[alert]`) from leaking raw `Referer` or raw query-bearing
 #   request lines into `passport_error.log`.
 #   Observability trade-off: 400 rejections from `$passport_unsafe_referer` or
-#   `$passport_credential_query` are not written to `passport_access.log`;
-#   permitted non-credential-query traffic keeps full access logging.
+#   `$passport_unsafe_query` are not written to `passport_access.log`;
+#   permitted requests (empty query or `/xiaozhi/v1/?from=mqtt_gateway`, with
+#   empty or bare-origin Referer on non-secret routes) keep full redacted
+#   access logging and error logging.
 # - If APM / OpenTelemetry / WAF / ingress tracing is enabled on this proxy,
 #   disable trace capture or scrub `http.target`, `url.path`, `url.full`, and
 #   `http.url` on `/xiaozhi/ota/d/*` so per-device secrets do not enter traces.
@@ -60,28 +71,35 @@ map $http_referer $passport_unsafe_referer {
     default                                                     1;
 }
 
-# Reject credentials passed in query strings. Shared between the server/location
-# guards (`if ($passport_credential_query) { return 400; }`) and conditional
-# access logging (`$passport_log_access`) so rejected credential-bearing queries
-# never attempt an access_log write (which on write failure / short write emits
-# an `[alert]` to `passport_error.log` containing the raw request line).
-map $args $passport_credential_query {
-    ~*(^|&)(authorization|token|access_token|refresh_token|id_token|secret|ota_secret|key|api_key|apikey|password|sig|signature|auth)= 1;
-    default                                                                                                                             0;
+# Enforce a strict route-scoped allowlist on query strings. Nginx's `$args` and
+# `$arg_*` operate on raw un-decoded query bytes (per `ngx_http_parse.c`), so
+# a denylist on raw `$args` or `$arg_*` can be bypassed by percent-encoded keys
+# such as `?%74oken=...` while the backend (`parse_qsl`) decodes them.
+# Because Passport HTTP/WS endpoints accept no query parameters other than the
+# exact `/xiaozhi/v1/?from=mqtt_gateway` handshake tag, prefixing `$is_args$args`
+# prevents `|` smuggling (`?|token=x`) and rejects every literal, encoded, or
+# unexpected query parameter before routing or proxying. Shared with
+# `$passport_log_access` so rejected query requests never attempt an access_log
+# write (which on write failure / short write emits an `[alert]` containing the
+# raw request line).
+map "$is_args$args|$uri" $passport_unsafe_query {
+    ~^\|                               0;
+    "?from=mqtt_gateway|/xiaozhi/v1/"  0;
+    default                            1;
 }
 
-# Skip access_log writes whenever the Referer allowlist or credential-query
-# guard rejects a request (or when a server-level guard rejects a
+# Skip access_log writes whenever the Referer allowlist or query allowlist
+# rejects a request (or when a server-level guard rejects a
 # `/xiaozhi/ota/d/` URI before location matching). Otherwise, an access_log
 # write failure or short write causes Nginx (`ngx_http_log_write`) to emit an
 # `[alert]` to `r->connection->log`, whose error-log formatter appends the RAW
 # client `referrer` and RAW request line (including query parameter values).
 # Observability trade-off: 400 rejections from `$passport_unsafe_referer` or
-# `$passport_credential_query` are intentionally omitted from
-# `passport_access.log`; allowed requests (empty or bare-origin Referer without
-# credential query parameters on non-secret routes) keep full access & error
-# logging.
-map "$passport_unsafe_referer:$passport_credential_query:$uri" $passport_log_access {
+# `$passport_unsafe_query` are intentionally omitted from
+# `passport_access.log`; allowed requests (empty or bare-origin Referer with
+# empty query or exact `/xiaozhi/v1/?from=mqtt_gateway` on non-secret routes)
+# keep full redacted access & error logging.
+map "$passport_unsafe_referer:$passport_unsafe_query:$uri" $passport_log_access {
     ~^1:                         0;
     ~^0:1:                       0;
     ~(?i)^0:0:/xiaozhi/+ota/+d/  0;
@@ -120,9 +138,9 @@ server {
         return 400;
     }
 
-    # Reject credentials passed in query strings before routing/proxying (shared
-    # with `$passport_log_access` so rejected queries skip access_log writes).
-    if ($passport_credential_query) {
+    # Enforce the strict route-scoped query allowlist before routing/proxying
+    # (shared with `$passport_log_access` so rejected queries skip access_log writes).
+    if ($passport_unsafe_query) {
         return 400;
     }
 
@@ -133,7 +151,7 @@ server {
         log_not_found off;
         log_subrequest off;
 
-        if ($passport_credential_query) {
+        if ($passport_unsafe_query) {
             return 400;
         }
 
@@ -145,7 +163,7 @@ server {
 
             set $passport_ota_secret $ota_secret_cap;
 
-            if ($passport_credential_query) {
+            if ($passport_unsafe_query) {
                 return 400;
             }
 

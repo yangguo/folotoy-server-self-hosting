@@ -69,11 +69,13 @@ guard_paths "$DEMO_RUNTIME" "$DEMO_HOME" "$DEMO_HOME/tmp" "$DEMO_HOME/data" "$DE
 
 mkdir -p "$DEMO_RUNTIME" "$DEMO_HOME/data" "$DEMO_HOME/tmp"
 
-# Writable outputs are recreated on every run. `rm -f` unlinks a pre-existing
-# symlink / hard link at that path without touching its target, so the shell
-# `>` redirections and writers below can never truncate or rewrite real files.
+# Writable outputs (and their sidecar lock files) are recreated on every run.
+# `rm -f` unlinks a pre-existing symlink / hard link at that path without
+# touching its target, so redirects, writers, and sidecar fchmod() can never
+# truncate, rewrite, or re-chmod real files.
 set -- "$DEMO_RUNTIME/fake-provider.log" "$DEMO_RUNTIME/xiaozhi-server.log" \
   "$DEMO_RUNTIME/devices.yaml" "$DEMO_RUNTIME/auth_key" \
+  "$DEMO_RUNTIME/.devices.yaml.lock" "$DEMO_RUNTIME/.auth_key.lock" \
   "$DEMO_HOME/tmp/server.log" "$DEMO_HOME/data/.config.yaml"
 for out in "$@"; do
   rm -f "$out"

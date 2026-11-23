@@ -16,11 +16,19 @@
 #   the site access-log filter do NOT apply to them. The global options block
 #   below therefore excludes those loggers from the unfiltered default log and
 #   routes them to a dedicated sink with the same field filters.
-# - Credential query guard: `@credential_query` uses `vars_regexp` against
-#   `{query}` (instead of Caddy's `query` matcher, which ANDs distinct keys) so
-#   any single credential parameter matches, and all site directives sit inside
-#   an ordered `route` block so `log_skip` and `respond @credential_query 400`
-#   execute ahead of every `handle` / `reverse_proxy`.
+# - Unsafe query guard: raw `{query}` regexes (`vars_regexp`) miss percent-
+#   encoded query keys such as `?%74oken=...`, while Caddy's `query` matcher is
+#   case-sensitive on keys (`?TOKEN=...` or `?%54oken=...` bypasses it).
+#   Because Passport routes require no query parameters except exact
+#   `/xiaozhi/v1/?from=mqtt_gateway`, `@unsafe_query` enforces a strict
+#   route-scoped CEL `expression` allowlist ahead of all `handle` /
+#   `reverse_proxy` directives inside an ordered `route { ... }` block and
+#   shares `log_skip @unsafe_query` with `respond @unsafe_query 400`.
+#   Observability trade-off: 400 rejections from `@unsafe_query` and all
+#   `/xiaozhi/ota/d/*` requests skip Caddy access logging; permitted non-secret
+#   traffic (e.g. `/xiaozhi/ota/`, `/xiaozhi/v1/?from=mqtt_gateway`) retains
+#   redacted JSON access logging, and backend errors (502) go only to the
+#   filtered `passport_error.log`.
 # - If external APM / OpenTelemetry / WAF instrumentation is attached, disable or
 #   scrub `http.target`, `url.path`, `url.full`, and `http.url` on `/xiaozhi/ota/d/*`.
 
@@ -79,8 +87,8 @@ your-passport-host.example.com {
         }
     }
 
-    @credential_query {
-        vars_regexp cred_query {query} (?i)(^|&)(authorization|token|access_token|refresh_token|id_token|secret|ota_secret|key|api_key|apikey|password|sig|signature|auth)=
+    @unsafe_query {
+        expression `{query} != "" && !({path} == "/xiaozhi/v1/" && {query} == "from=mqtt_gateway")`
     }
 
     @ota_secret_path {
@@ -90,7 +98,8 @@ your-passport-host.example.com {
 
     route {
         log_skip @ota_secret_prefix
-        respond @credential_query 400
+        log_skip @unsafe_query
+        respond @unsafe_query 400
 
         handle @ota_secret_path {
             rewrite * /xiaozhi/ota/
