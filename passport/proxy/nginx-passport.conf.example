@@ -21,6 +21,13 @@
 #   Referer other than absent/empty or a bare HTTP(S) origin (`scheme://host[:port][/]`)
 #   before any location / proxy / body-size error can be logged, blocking literal,
 #   percent-encoded, dot-segment, userinfo, and query-bearing Referers alike.
+# - In addition, `access_log` uses `if=$passport_log_access` to skip access-log
+#   writes whenever `$passport_unsafe_referer` rejects a request (or when a
+#   server-level guard rejects a `/xiaozhi/ota/d/` URI before location matching),
+#   preventing an access-log write failure / short write (`[alert]`) from leaking
+#   raw `Referer` or secret request lines into `passport_error.log`.
+#   Observability trade-off: 400 rejections from `$passport_unsafe_referer` are
+#   not written to `passport_access.log`; normal permitted traffic keeps logging.
 # - If APM / OpenTelemetry / WAF / ingress tracing is enabled on this proxy,
 #   disable trace capture or scrub `http.target`, `url.path`, `url.full`, and
 #   `http.url` on `/xiaozhi/ota/d/*` so per-device secrets do not enter traces.
@@ -51,6 +58,20 @@ map $http_referer $passport_unsafe_referer {
     default                                                     1;
 }
 
+# Skip access_log writes whenever the Referer allowlist rejects a request (or
+# when a server-level guard rejects a `/xiaozhi/ota/d/` URI before location
+# matching). Otherwise, an access_log write failure or short write causes Nginx
+# (`ngx_http_log_write`) to emit an `[alert]` to `r->connection->log`, whose
+# error-log formatter appends the RAW client `referrer` (and raw request line).
+# Observability trade-off: 400 rejections from `$passport_unsafe_referer` are
+# intentionally omitted from `passport_access.log`; allowed requests (empty or
+# bare-origin Referer on non-secret routes) keep full access & error logging.
+map "$passport_unsafe_referer:$uri" $passport_log_access {
+    ~^1:                       0;
+    ~(?i)^0:/xiaozhi/+ota/+d/  0;
+    default                    1;
+}
+
 # Access logs omit $http_referer completely (emitting literal `"-"`) so no
 # client-supplied Referer encoding can ever write OTA credentials to access logs.
 log_format passport_safe '$remote_addr - [$time_local] '
@@ -68,15 +89,17 @@ server {
     ssl_certificate_key /etc/ssl/passport/privkey.pem;
     ssl_protocols       TLSv1.2 TLSv1.3;
 
-    access_log /var/log/nginx/passport_access.log passport_safe;
+    access_log /var/log/nginx/passport_access.log passport_safe if=$passport_log_access;
     error_log  /var/log/nginx/passport_error.log warn;
 
     # Site error-log guard: nginx appends the raw client Referer to every
-    # error-log line (upstream failures, body-size errors, ...). Reject any
-    # Referer not matching the empty/bare-origin allowlist here, in the
-    # server-rewrite phase (before location matching, client_max_body_size
-    # checks, and proxying), so equivalent percent-encoded/normalized OTA paths
-    # can never reach passport_error.log. `return` writes nothing to error_log.
+    # error-log line (upstream failures, body-size errors, access_log write
+    # `[alert]`s, ...). Reject any Referer not matching the empty/bare-origin
+    # allowlist here, in the server-rewrite phase (before location matching,
+    # client_max_body_size checks, and proxying), and combine with
+    # `if=$passport_log_access` on `access_log` so rejected requests skip
+    # access-log writes as well — preventing both upstream errors and
+    # access_log write-failure alerts from writing raw Referers to error_log.
     if ($passport_unsafe_referer) {
         return 400;
     }
@@ -136,7 +159,7 @@ server {
     }
 
     location = /xiaozhi/ota/ {
-        access_log /var/log/nginx/passport_access.log passport_safe;
+        access_log /var/log/nginx/passport_access.log passport_safe if=$passport_log_access;
 
         proxy_http_version 1.1;
         proxy_set_header Host $host;
@@ -157,7 +180,7 @@ server {
     }
 
     location ^~ /xiaozhi/ota/download/ {
-        access_log /var/log/nginx/passport_access.log passport_safe;
+        access_log /var/log/nginx/passport_access.log passport_safe if=$passport_log_access;
 
         proxy_http_version 1.1;
         proxy_set_header Host $host;
@@ -178,7 +201,7 @@ server {
     }
 
     location = /mcp/vision/explain {
-        access_log /var/log/nginx/passport_access.log passport_safe;
+        access_log /var/log/nginx/passport_access.log passport_safe if=$passport_log_access;
         client_max_body_size 6m;
 
         proxy_http_version 1.1;
@@ -200,7 +223,7 @@ server {
     }
 
     location ^~ /xiaozhi/v1/ {
-        access_log /var/log/nginx/passport_access.log passport_safe;
+        access_log /var/log/nginx/passport_access.log passport_safe if=$passport_log_access;
 
         proxy_http_version 1.1;
         proxy_set_header Upgrade $http_upgrade;
