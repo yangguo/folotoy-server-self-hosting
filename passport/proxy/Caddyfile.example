@@ -1,0 +1,173 @@
+# Ready-to-adopt Caddy v2 HTTPS/WSS reverse proxy template for AI Passport.
+#
+# Replace your-passport-host.example.com with your actual domain.
+#
+# Security & log-safety guarantees:
+# - Uses `log_skip` on `/xiaozhi/ota/d/*` so per-device OTA secrets in the URI
+#   are never written to Caddy access logs.
+# - Filters remaining access log fields (`request>uri`, `request>orig_uri`,
+#   `Authorization`, `X-Ota-Secret`, `Cookie`, `Referer`) to `[REDACTED]`.
+# - Extracts the per-device secret from `/xiaozhi/ota/d/<secret>/` into
+#   `X-OTA-Secret`, rewrites to `/xiaozhi/ota/`, and strips tracing URI headers.
+# - Runtime/error logs: when a backend fails (e.g. dial refused -> 502), Caddy's
+#   `http.log.error` and `http.handlers.reverse_proxy` loggers embed the ORIGINAL
+#   request (captured before `rewrite`, so `request>uri` can still contain
+#   `/xiaozhi/ota/d/<secret>/`) plus raw headers such as Referer. `log_skip` and
+#   the site access-log filter do NOT apply to them. The global options block
+#   below therefore excludes those loggers from the unfiltered default log and
+#   routes them to a dedicated sink with the same field filters.
+# - Unsafe path & query guards: raw `{query}` regexes (`vars_regexp`) miss
+#   percent-encoded query keys such as `?%74oken=...`, while Caddy's `query`
+#   matcher is case-sensitive on keys (`?TOKEN=...` or `?%54oken=...` bypasses
+#   it). Likewise, Caddy's `path` matcher cleans dot-segments and matches
+#   case-insensitively while `reverse_proxy` forwards the raw un-normalized
+#   request target (`{http.request.orig_uri}`), so `/xiaozhi/ota/d/<secret>/..`
+#   or `/xiaozhi/ota/d/<secret>/../../` can bypass `/xiaozhi/ota/d/*` and reach
+#   the HTTP upstream under `/xiaozhi/ota/*`. Therefore, `@unsafe_query` and
+#   `@unsafe_path` enforce strict route-scoped CEL `expression` allowlists
+#   ahead of all `handle` / `reverse_proxy` directives inside an ordered
+#   `route { ... }` block and share `log_skip` with `respond ... 400`.
+#   Observability trade-off: 400 rejections from `@unsafe_query` / `@unsafe_path`
+#   and all `/xiaozhi/ota/d/*` requests skip Caddy access logging; permitted
+#   non-secret canonical traffic (e.g. `/xiaozhi/ota/`,
+#   `/xiaozhi/v1/?from=mqtt_gateway`) retains redacted JSON access logging, and
+#   backend errors (502) go only to the filtered `passport_error.log`.
+# - If external APM / OpenTelemetry / WAF instrumentation is attached, disable or
+#   scrub `http.target`, `url.path`, `url.full`, and `http.url` on `/xiaozhi/ota/d/*`.
+
+# Global options block (must be the first block in the Caddyfile).
+{
+    log default {
+        output stderr
+        exclude http.log.error http.handlers.reverse_proxy
+    }
+    log passport_runtime_errors {
+        include http.log.error http.handlers.reverse_proxy
+        output file /var/log/caddy/passport_error.log
+        format filter {
+            wrap json
+            fields {
+                request>uri replace "[REDACTED]"
+                request>orig_uri replace "[REDACTED]"
+                request>headers>Authorization replace "[REDACTED]"
+                request>headers>X-Ota-Secret replace "[REDACTED]"
+                request>headers>X-Api-Key replace "[REDACTED]"
+                request>headers>X-Auth-Token replace "[REDACTED]"
+                request>headers>Cookie replace "[REDACTED]"
+                request>headers>Referer replace "[REDACTED]"
+                request>headers>X-Original-Uri replace "[REDACTED]"
+                request>headers>X-Original-Url replace "[REDACTED]"
+                request>headers>X-Rewrite-Url replace "[REDACTED]"
+                request>headers>X-Forwarded-Uri replace "[REDACTED]"
+                request>headers>X-Envoy-Original-Path replace "[REDACTED]"
+                request>headers>X-Request-Uri replace "[REDACTED]"
+            }
+        }
+    }
+}
+
+your-passport-host.example.com {
+    log {
+        output file /var/log/caddy/passport_access.log
+        format filter {
+            wrap json
+            fields {
+                request>uri replace "[REDACTED]"
+                request>orig_uri replace "[REDACTED]"
+                request>headers>Authorization replace "[REDACTED]"
+                request>headers>X-Ota-Secret replace "[REDACTED]"
+                request>headers>X-Api-Key replace "[REDACTED]"
+                request>headers>X-Auth-Token replace "[REDACTED]"
+                request>headers>Cookie replace "[REDACTED]"
+                request>headers>Referer replace "[REDACTED]"
+                request>headers>X-Original-Uri replace "[REDACTED]"
+                request>headers>X-Original-Url replace "[REDACTED]"
+                request>headers>X-Rewrite-Url replace "[REDACTED]"
+                request>headers>X-Forwarded-Uri replace "[REDACTED]"
+                request>headers>X-Envoy-Original-Path replace "[REDACTED]"
+                request>headers>X-Request-Uri replace "[REDACTED]"
+            }
+        }
+    }
+
+    @unsafe_query {
+        expression `{query} != "" && !({path} == "/xiaozhi/v1/" && {query} == "from=mqtt_gateway")`
+    }
+
+    @unsafe_path {
+        expression `!({http.request.orig_uri}.matches("^(/xiaozhi/ota/|/xiaozhi/ota/download/[A-Za-z0-9_][A-Za-z0-9._-]*|/mcp/vision/explain|/xiaozhi/v1/)(\\?.*)?$") || path("/xiaozhi/ota/d/*") || ({http.request.orig_uri} == {path} && !path("/xiaozhi/*", "/mcp/*") && !{path}.matches("(^|/)\\.{1,2}(/|$)|//")))`
+    }
+
+    @ota_secret_path {
+        path_regexp ota ^/xiaozhi/ota/d/([^/]+)/?$
+    }
+    @ota_secret_prefix path /xiaozhi/ota/d/*
+
+    route {
+        log_skip @ota_secret_prefix
+        log_skip @unsafe_query
+        log_skip @unsafe_path
+        respond @unsafe_query 400
+        respond @unsafe_path 400
+
+        handle @ota_secret_path {
+            rewrite * /xiaozhi/ota/
+            reverse_proxy 127.0.0.1:18013 {
+                header_up X-OTA-Secret {re.ota.1}
+                header_up -Authorization
+                header_up -X-Original-URI
+                header_up -X-Original-URL
+                header_up -X-Rewrite-URL
+                header_up -X-Forwarded-Uri
+                header_up -X-Envoy-Original-Path
+                header_up -X-Request-URI
+                header_up -Referer
+            }
+        }
+
+        handle @ota_secret_prefix {
+            respond 404
+        }
+
+        handle /xiaozhi/ota/* {
+            reverse_proxy 127.0.0.1:18013 {
+                header_up -X-Original-URI
+                header_up -X-Original-URL
+                header_up -X-Rewrite-URL
+                header_up -X-Forwarded-Uri
+                header_up -X-Envoy-Original-Path
+                header_up -X-Request-URI
+                header_up -Referer
+            }
+        }
+
+        handle /mcp/vision/explain {
+            request_body {
+                max_size 6MB
+            }
+            reverse_proxy 127.0.0.1:18013 {
+                header_up -X-Original-URI
+                header_up -X-Original-URL
+                header_up -X-Rewrite-URL
+                header_up -X-Forwarded-Uri
+                header_up -X-Envoy-Original-Path
+                header_up -X-Request-URI
+                header_up -Referer
+            }
+        }
+
+        handle /xiaozhi/v1/* {
+            reverse_proxy 127.0.0.1:18010 {
+                header_up -X-Original-URI
+                header_up -X-Original-URL
+                header_up -X-Rewrite-URL
+                header_up -X-Forwarded-Uri
+                header_up -X-Envoy-Original-Path
+                header_up -X-Request-URI
+                header_up -Referer
+            }
+        }
+
+        respond 404
+    }
+}

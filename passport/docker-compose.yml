@@ -1,0 +1,37 @@
+# Opt-in AI Passport stack (REAL configuration mode by default).
+# Does not attach to the root docker-compose.yml networks, volumes, or toy ports.
+#
+# Prerequisites for real deployment:
+# 1. cp passport/config/server.config.example.yaml passport/config/server.config.yaml
+#    and fill in your real ASR / LLM / TTS providers and public endpoints.
+# 2. Provision devices into passport/runtime/devices.yaml via
+#    python passport/scripts/provision_device.py add ...
+#
+# For isolated fake-provider contract/demo testing instead, run:
+#   docker compose -p folotoy-passport-demo -f docker-compose.yml -f docker-compose.demo.yml up --build
+name: folotoy-passport
+
+services:
+  xiaozhi-server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        XIAOZHI_SERVER_COMMIT: 8f2dda09cf18f1c1ece0f906eee4cc2fabb7fb58
+    environment:
+      XIAOZHI_HOME: /opt/xiaozhi-esp32-server
+      PASSPORT_MODE: real
+      PASSPORT_CONFIG_FILE: /opt/passport/config/server.config.yaml
+      PASSPORT_DEVICES_FILE: /opt/passport/runtime/devices.yaml
+      PASSPORT_AUTH_FILE: /opt/passport/runtime/auth_key
+      PASSPORT_BIND: 0.0.0.0
+      PASSPORT_WS_BIND_PORT: "8000"
+      PASSPORT_HTTP_BIND_PORT: "8003"
+      PASSPORT_AUTH_KEY: ${PASSPORT_AUTH_KEY:-}
+    volumes:
+      - ./config:/opt/passport/config:ro
+      - ./runtime:/opt/passport/runtime
+    ports:
+      - "127.0.0.1:18010:8000"
+      - "127.0.0.1:18013:8003"
+    restart: "no"

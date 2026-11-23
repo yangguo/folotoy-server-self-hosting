@@ -9,7 +9,9 @@
 - AI 对话数据发布到**MQTT**服务器
 
 ## 文档
-文档可在 [docs.folotoy.com](https://docs.folotoy.com/) 上找到。 
+文档可在 [docs.folotoy.com](https://docs.folotoy.com/) 上找到。
+
+AI Passport（小智 WebSocket）使用另一套独立配置，不改动上面的旧玩具 Compose。说明、回退方式和限制见 [passport/README.zh_CN.md](passport/README.zh_CN.md)。
 
 
 ## OpenClaw Skill 部署

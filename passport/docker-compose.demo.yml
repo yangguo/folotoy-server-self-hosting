@@ -1,0 +1,38 @@
+# Explicit demo / contract-test Compose override using fake_provider.py.
+# Usage (always pass -p: COMPOSE_PROJECT_NAME in the environment would otherwise
+# override the `name:` below and could reuse the real Compose project):
+#   docker compose -p folotoy-passport-demo -f docker-compose.yml -f docker-compose.demo.yml up --build
+#
+# Uses a separate Compose project name and isolated ./runtime-compose-demo state
+# directory so real ./runtime/devices.yaml, auth_key, and data/.config.yaml are
+# never mounted, modified, or deleted.
+# fake-provider is kept internal to the Compose network (no host port publish).
+name: folotoy-passport-demo
+
+services:
+  fake-provider:
+    image: python:3.12-slim-bookworm
+    command: ["python", "/opt/passport/fake_provider.py", "--host", "0.0.0.0", "--port", "18019"]
+    volumes:
+      - ./fake_provider.py:/opt/passport/fake_provider.py:ro
+    restart: "no"
+
+  xiaozhi-server:
+    depends_on:
+      - fake-provider
+    environment:
+      PASSPORT_MODE: demo
+      PASSPORT_CONFIG_FILE: /opt/passport/config/demo.config.yaml
+      PASSPORT_DEVICES_FILE: /opt/passport/runtime-compose-demo/devices.yaml
+      PASSPORT_AUTH_FILE: /opt/passport/runtime-compose-demo/auth_key
+      PASSPORT_LOG_DIR: /opt/passport/runtime-compose-demo/logs
+      PASSPORT_FAKE_BASE: http://fake-provider:18019
+      PASSPORT_PUBLIC_WS: ws://127.0.0.1:18010/xiaozhi/v1/
+      PASSPORT_PUBLIC_HTTP: http://127.0.0.1:18013/mcp/vision/explain
+      # Never inherit the real signing key from the host shell or passport/.env.
+      PASSPORT_AUTH_KEY: ""
+    volumes:
+      - ./config:/opt/passport/config:ro
+      - ./runtime-compose-demo:/opt/passport/runtime
+      - ./runtime-compose-demo:/opt/passport/runtime-compose-demo
+      - ./runtime-compose-demo/data:/opt/xiaozhi-esp32-server/data

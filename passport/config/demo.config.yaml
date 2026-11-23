@@ -1,0 +1,90 @@
+# Explicit demo / contract-test configuration for PASSPORT_MODE=demo ONLY.
+#
+# Points ASR, LLM, and TTS to local fake_provider.py so tests can exercise the
+# real xiaozhi-server without cloud model API keys. Real deployments MUST use
+# PASSPORT_MODE=real (the default) with passport/config/server.config.yaml.
+server:
+  ip: 127.0.0.1
+  port: 18010
+  http_port: 18013
+  websocket: ws://127.0.0.1:18010/xiaozhi/v1/
+  vision_explain: http://127.0.0.1:18013/mcp/vision/explain
+  timezone_offset: 8
+  auth_key: replace-with-a-long-random-string
+  auth:
+    enabled: true
+    expire_seconds: 86400
+    devices_file: /opt/passport/runtime-demo/devices.yaml
+    allowed_devices: []
+  mqtt_gateway: null
+  mqtt_signature_key: null
+  udp_gateway: null
+
+read_config_from_api: false
+enable_wakeup_words_response_cache: false
+enable_greeting: false
+tts_timeout: 15
+end_prompt:
+  enable: false
+
+xiaozhi:
+  type: hello
+  version: 1
+  transport: websocket
+  audio_params:
+    format: opus
+    sample_rate: 16000
+    channels: 1
+    frame_duration: 60
+
+selected_module:
+  VAD: SileroVAD
+  ASR: PassportLocalASR
+  LLM: PassportLocalLLM
+  TTS: PassportLocalTTS
+  Memory: nomem
+  Intent: nointent
+
+VAD:
+  SileroVAD:
+    type: silero
+    threshold: 0.5
+    threshold_low: 0.3
+    model_dir: models/snakers4_silero-vad
+    min_silence_duration_ms: 200
+
+ASR:
+  PassportLocalASR:
+    type: openai
+    api_key: local-fake-provider
+    base_url: http://127.0.0.1:18019/v1/audio/transcriptions
+    model_name: fake-asr
+    output_dir: tmp/
+    connect_timeout: 3
+    read_timeout: 10
+    write_timeout: 5
+    pool_timeout: 3
+    total_timeout: 12
+
+LLM:
+  PassportLocalLLM:
+    type: openai
+    api_key: local-fake-provider
+    base_url: http://127.0.0.1:18019/v1
+    model_name: fake-llm
+    timeout:
+      connect: 3
+      read: 10
+      write: 5
+      pool: 3
+
+TTS:
+  PassportLocalTTS:
+    type: openai
+    api_key: local-fake-provider
+    api_url: http://127.0.0.1:18019/v1/audio/speech
+    model: fake-tts
+    voice: alloy
+    format: wav
+    speed: 1
+    output_dir: tmp/

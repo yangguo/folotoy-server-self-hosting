@@ -1,0 +1,30 @@
+# Subset of xinnan-tech/xiaozhi-esp32-server main/xiaozhi-server/requirements.txt
+# at tag v0.9.8 (8f2dda09cf18f1c1ece0f906eee4cc2fabb7fb58).
+# Versions match that file. Torch, FunASR, ModelScope, and silero_vad's torch
+# metadata dependency are omitted because Passport runs Silero ONNX directly
+# via onnxruntime and OpenAI-compatible HTTP providers.
+# Switching back to FunASR requires the upstream requirements.txt.
+pyyml==0.0.2
+websockets==14.2
+aiohttp==3.14.5
+aiohttp_cors==0.8.1
+loguru==0.7.3
+opuslib_next==1.3.1
+numpy==1.26.4
+onnxruntime==1.20.1
+pydub==0.25.1
+requests==2.34.2
+openai==2.8.1
+httpx==0.28.1
+aioconsole==0.8.2
+PyJWT==2.15.1
+ormsgpack==1.12.2
+psutil==7.2.2
+portalocker==3.2.0
+Jinja2==3.1.6
+PyYAML==6.0.2
+cryptography==49.0.0
+mcp==2.3.0
+bs4==0.0.2
+markitdown==0.1.8
+cnlunar==0.2.5

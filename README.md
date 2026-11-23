@@ -14,6 +14,8 @@ A customized, self-hosted server for your Folotoys.
 
 The documentation is available at [docs.folotoy.com](https://docs.folotoy.com/).
 
+AI Passport uses a separate opt-in WebSocket stack. See [passport/README.zh_CN.md](passport/README.zh_CN.md). The root Compose file is unchanged.
+
 
 
 ## OpenClaw Skill Deployment
