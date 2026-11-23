@@ -8,6 +8,8 @@ key, and so regression tests can simulate slow, hanging, or failing providers.
 """
 
 import argparse
+from email.parser import BytesParser
+from email.policy import default as email_default_policy
 import io
 import json
 import math
@@ -22,6 +24,37 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 FAKE_KEY = "local-fake-provider"
 DEFAULT_TRANSCRIPT = "合约测试"
 DEFAULT_REPLY = "收到。这是本地假模型，不是语音理解。"
+
+
+def _extract_uploaded_audio_metrics(content_type: str, raw_body: bytes) -> tuple[int, int]:
+    """Return (wav_bytes, pcm_bytes) from a multipart ASR upload, or (0, 0) if unavailable."""
+    if not raw_body or "multipart/" not in (content_type or "").lower():
+        return 0, 0
+    try:
+        header_bytes = f"Content-Type: {content_type}\r\nMIME-Version: 1.0\r\n\r\n".encode(
+            "latin-1", "replace"
+        )
+        msg = BytesParser(policy=email_default_policy).parsebytes(header_bytes + raw_body)
+        if not msg.is_multipart():
+            return 0, 0
+        for part in msg.iter_parts():
+            disp_name = part.get_param("name", header="content-disposition")
+            ctype = (part.get_content_type() or "").lower()
+            if disp_name == "file" or ctype.startswith("audio/"):
+                payload = part.get_payload(decode=True)
+                if not isinstance(payload, (bytes, bytearray)) or not payload:
+                    continue
+                wav_bytes = len(payload)
+                pcm_bytes = 0
+                try:
+                    with wave.open(io.BytesIO(payload), "rb") as wf:
+                        pcm_bytes = wf.getnframes() * wf.getsampwidth() * wf.getnchannels()
+                except Exception:
+                    pcm_bytes = 0
+                return wav_bytes, pcm_bytes
+    except Exception:
+        return 0, 0
+    return 0, 0
 
 
 def sine_wav(seconds: float = 1.5, sample_rate: int = 16000, frequency: int = 440) -> bytes:
@@ -193,6 +226,10 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         if path == "/v1/audio/transcriptions":
+            wav_bytes, pcm_bytes = _extract_uploaded_audio_metrics(
+                self.headers.get("Content-Type", ""),
+                raw_body,
+            )
             with STATE.lock:
                 req_id = STATE.next_asr_req_id
                 STATE.next_asr_req_id += 1
@@ -201,6 +238,8 @@ class Handler(BaseHTTPRequestHandler):
                     "state": "in_flight",
                     "started_at": time.monotonic(),
                     "ended_at": None,
+                    "wav_bytes": wav_bytes,
+                    "pcm_bytes": pcm_bytes,
                 }
                 STATE.asr_in_flight += 1
                 STATE.asr_total += 1

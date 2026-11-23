@@ -6396,6 +6396,435 @@ asyncio.run(run())
     )
 
 
+def test_manual_listen_stop_queue_ordering_unit(server_home: Path) -> None:
+    """Verify manual listen.stop is strictly ordered behind queued/in-flight PCM and invalidated on abort/close/new turn."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp = Path(tmpdir)
+        srv_home = _make_srv_home(server_home, tmp / "manual_stop_order_srv_home")
+        devices_file = tmp / "devices.yaml"
+        auth_file = tmp / "auth_key"
+        subprocess.run(
+            [
+                sys.executable,
+                str(ROOT / "scripts" / "provision_device.py"),
+                "add",
+                "--devices-file",
+                str(devices_file),
+                "--device-id",
+                "aa:bb:cc:dd:ee:88",
+                "--client-id",
+                "manual-stop-order-client",
+                "--json",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        subprocess.run(
+            [sys.executable, str(ROOT / "scripts" / "write_config.py")],
+            env=_base_env(
+                XIAOZHI_HOME=str(srv_home),
+                PASSPORT_MODE="demo",
+                PASSPORT_AUTH_FILE=str(auth_file),
+                PASSPORT_DEVICES_FILE=str(devices_file),
+                PASSPORT_LOG_DIR=str(srv_home / "tmp"),
+                PASSPORT_FAKE_BASE="http://127.0.0.1:18019",
+            ),
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
+        probe_code = """
+import asyncio, json, math, os, queue, struct, sys, threading, time
+import opuslib_next
+from opuslib_next import constants
+
+os.chdir(os.environ["XIAOZHI_HOME"])
+for p in (os.environ["PASSPORT_ROOT"], os.environ["XIAOZHI_HOME"]):
+    if p not in sys.path:
+        sys.path.insert(0, p)
+
+from config.config_loader import load_config
+import core.handle.receiveAudioHandle as receive_audio_handle
+import core.providers.asr.base as asr_base
+from passport_server.patches import apply_all_patches
+
+apply_all_patches()
+
+from core.connection import ConnectionHandler
+from core.handle.textHandler.listenMessageHandler import ListenTextMessageHandler
+from core.providers.asr.base import ASRProviderBase
+from core.providers.asr.dto.dto import InterfaceType
+
+def make_opus_frames(count: int) -> list[bytes]:
+    encoder = opuslib_next.Encoder(16000, 1, constants.APPLICATION_AUDIO)
+    frames = []
+    for index in range(count):
+        pcm = bytearray()
+        for sample in range(960):
+            value = int(6000 * math.sin(2 * math.pi * 330 * (index * 960 + sample) / 16000))
+            pcm += struct.pack("<h", value)
+        frames.append(encoder.encode(bytes(pcm), 960))
+    return frames
+
+def pcm_len(frames) -> int:
+    if not frames:
+        return 0
+    if isinstance(frames, (bytes, bytearray)):
+        return len(frames)
+    return sum(len(f) for f in frames)
+
+class HeldQueue(queue.Queue):
+    def __init__(self):
+        super().__init__()
+        self.gate = threading.Event()
+        self.at_gate = threading.Event()
+
+    def get(self, block=True, timeout=None):
+        deadline = None if timeout is None else (time.monotonic() + timeout)
+        while True:
+            if not self.gate.is_set():
+                if not block:
+                    raise queue.Empty
+                self.at_gate.set()
+                remaining = 30 if deadline is None else max(0.0, deadline - time.monotonic())
+                if remaining == 0 or not self.gate.wait(remaining):
+                    raise queue.Empty
+                continue
+            self.at_gate.clear()
+            if not block:
+                return super().get(block=False)
+            remaining = 0.01 if deadline is None else max(0.0, deadline - time.monotonic())
+            if remaining == 0:
+                raise queue.Empty
+            try:
+                return super().get(block=True, timeout=min(0.01, remaining))
+            except queue.Empty:
+                if deadline is not None and time.monotonic() >= deadline:
+                    raise
+
+class FakeWS:
+    def __init__(self):
+        self.closed = False
+        self.sent = []
+    async def send(self, msg):
+        self.sent.append(msg)
+    async def close(self):
+        self.closed = True
+
+class SpyVAD:
+    def __init__(self):
+        self.calls = 0
+    def is_vad(self, conn, pcm_frame):
+        self.calls += 1
+        return False
+    def release_conn_resources(self, conn):
+        return None
+
+async def wait_for(predicate, timeout_s=3.0, interval=0.005):
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        await asyncio.sleep(interval)
+    return False
+
+async def route_listen(conn, state: str, mode: str | None = None):
+    payload = {"session_id": conn.session_id, "type": "listen", "state": state}
+    if mode is not None:
+        payload["mode"] = mode
+    await conn._route_message(json.dumps(payload))
+
+async def route_abort(conn):
+    await conn._route_message(json.dumps({"session_id": conn.session_id, "type": "abort", "reason": "wake_word_detected"}))
+
+async def route_frames(conn, frames):
+    for f in frames:
+        await conn._route_message(f)
+
+async def new_conn(cfg, rec, *, hold_worker: bool, start_worker: bool = True):
+    class ControllableASR(ASRProviderBase):
+        def __init__(self):
+            super().__init__()
+            self.interface_type = InterfaceType.NON_STREAM
+            self.output_dir = os.environ["TEST_AUDIO_OUT"]
+            self.delete_audio_file = True
+            self.next_text = "MANUAL_ORDER_OK"
+            self.call_count = 0
+
+        async def speech_to_text(self, opus_data, session_id, artifacts=None):
+            return self.next_text, None
+
+        async def speech_to_text_wrapper(self, pcm_data, session_id):
+            self.call_count += 1
+            rec["asr"].append(pcm_len(pcm_data))
+            return self.next_text, None
+
+        async def close(self):
+            return None
+
+    asr = ControllableASR()
+    conn = ConnectionHandler(cfg, None, asr, None, None, None)
+    conn.loop = asyncio.get_running_loop()
+    conn.asr = asr
+    conn.vad = SpyVAD()
+    conn.websocket = FakeWS()
+    conn.need_bind = False
+    conn.bind_completed_event.set()
+    conn.last_activity_time = 0.0
+    if hold_worker:
+        conn.asr_audio_queue = HeldQueue()
+        assert isinstance(conn.asr_audio_queue, HeldQueue)
+    if start_worker:
+        await asr.open_audio_channels(conn)
+    return conn, asr
+
+async def shutdown_conn(conn):
+    conn.stop_event.set()
+    q = getattr(conn, "asr_audio_queue", None)
+    if isinstance(q, HeldQueue):
+        q.gate.set()
+    thread = getattr(conn, "asr_priority_thread", None)
+    if thread is not None and thread.is_alive():
+        thread.join(timeout=2.0)
+    await conn.close()
+
+async def run():
+    cfg = await load_config()
+    cfg["delete_audio"] = True
+    cfg["close_connection_no_voice_time"] = 10_000
+    frames17 = make_opus_frames(17)
+    expected17 = 1920 * 17
+    rec = {"asr": [], "reports": [], "chats": []}
+
+    def install_spies():
+        rec["asr"].clear()
+        rec["reports"].clear()
+        rec["chats"].clear()
+        def spy_enqueue(conn, text, opus_data):
+            rec["reports"].append(text)
+        async def spy_chat(conn, text):
+            rec["chats"].append(text)
+        asr_base.enqueue_asr_report = spy_enqueue
+        asr_base.startToChat = spy_chat
+
+    # 1. Full backlog (HeldQueue, 0 wait): start + 17 frames + stop -> single dispatch of full 32,640 bytes.
+    install_spies()
+    conn, asr = await new_conn(cfg, rec, hold_worker=True)
+    await route_listen(conn, "start", "manual")
+    await route_frames(conn, frames17)
+    await route_listen(conn, "stop")
+    assert pcm_len(conn.asr_audio) == 0 and conn.asr_audio_queue.qsize() == 18
+    assert rec == {"asr": [], "reports": [], "chats": []}
+    conn.asr_audio_queue.gate.set()
+    assert await wait_for(lambda: len(rec["chats"]) == 1 and conn.asr_audio_queue.empty())
+    assert rec == {"asr": [expected17], "reports": ["MANUAL_ORDER_OK"], "chats": ["MANUAL_ORDER_OK"]}, rec
+    assert pcm_len(conn.asr_audio) == 0 and conn.asr_audio_queue.empty()
+    # Duplicate stop must not re-dispatch anything.
+    await route_listen(conn, "stop")
+    assert await wait_for(lambda: conn.asr_audio_queue.empty())
+    await asyncio.sleep(0.02)
+    assert rec == {"asr": [expected17], "reports": ["MANUAL_ORDER_OK"], "chats": ["MANUAL_ORDER_OK"]}, rec
+    await shutdown_conn(conn)
+
+    # 2. Partial backlog (HeldQueue, 10 drained + 7 queued + immediate stop): single dispatch of full 32,640 bytes.
+    install_spies()
+    conn, asr = await new_conn(cfg, rec, hold_worker=True)
+    await route_listen(conn, "start", "manual")
+    await route_frames(conn, frames17[:10])
+    conn.asr_audio_queue.gate.set()
+    assert await wait_for(lambda: len(conn.asr_audio) == 10 and conn.asr_audio_queue.empty())
+    conn.asr_audio_queue.gate.clear()
+    assert conn.asr_audio_queue.at_gate.wait(1.0)
+    assert len(conn.asr_audio) == 10 and rec["asr"] == []
+    await route_frames(conn, frames17[10:])
+    await route_listen(conn, "stop")
+    assert len(conn.asr_audio) == 10 and conn.asr_audio_queue.qsize() == 8 and rec["asr"] == []
+    conn.asr_audio_queue.gate.set()
+    assert await wait_for(lambda: len(rec["chats"]) == 1 and conn.asr_audio_queue.empty())
+    assert rec == {"asr": [expected17], "reports": ["MANUAL_ORDER_OK"], "chats": ["MANUAL_ORDER_OK"]}, rec
+    assert pcm_len(conn.asr_audio) == 0
+    await route_listen(conn, "stop")
+    assert await wait_for(lambda: conn.asr_audio_queue.empty())
+    await asyncio.sleep(0.02)
+    assert rec["asr"] == [expected17], f"tail left behind for second stop: {rec}"
+    await shutdown_conn(conn)
+
+    # 3. Control (drain all 17 before stop): still dispatches full 32,640 bytes once.
+    install_spies()
+    conn, asr = await new_conn(cfg, rec, hold_worker=True)
+    await route_listen(conn, "start", "manual")
+    await route_frames(conn, frames17)
+    conn.asr_audio_queue.gate.set()
+    assert await wait_for(lambda: len(conn.asr_audio) == 17 and conn.asr_audio_queue.empty())
+    await route_listen(conn, "stop")
+    assert await wait_for(lambda: len(rec["chats"]) == 1 and conn.asr_audio_queue.empty())
+    assert rec == {"asr": [expected17], "reports": ["MANUAL_ORDER_OK"], "chats": ["MANUAL_ORDER_OK"]}, rec
+    await shutdown_conn(conn)
+
+    # 4. Real unheld queue, 0 wait between last frame and stop across 3 consecutive rounds.
+    install_spies()
+    conn, asr = await new_conn(cfg, rec, hold_worker=False)
+    for round_idx in range(1, 4):
+        asr.next_text = f"UNHELD_R{round_idx}"
+        await route_listen(conn, "start", "manual")
+        await route_frames(conn, frames17)
+        await route_listen(conn, "stop")
+        assert await wait_for(lambda idx=round_idx: len(rec["chats"]) == idx and conn.asr_audio_queue.empty())
+    assert rec["asr"] == [expected17, expected17, expected17], rec
+    assert rec["reports"] == ["UNHELD_R1", "UNHELD_R2", "UNHELD_R3"], rec
+    assert rec["chats"] == ["UNHELD_R1", "UNHELD_R2", "UNHELD_R3"], rec
+    assert pcm_len(conn.asr_audio) == 0
+    await shutdown_conn(conn)
+
+    # 5a. Client abort while stop is still pending in HeldQueue + same-connection recovery (without and with listen.start).
+    install_spies()
+    conn, asr = await new_conn(cfg, rec, hold_worker=True)
+    asr.next_text = "STALE_PENDING_ABORT"
+    await route_listen(conn, "start", "manual")
+    await route_frames(conn, frames17)
+    await route_listen(conn, "stop")
+    epoch_before_abort = conn._passport_audio_epoch
+    await route_abort(conn)
+    assert conn._passport_audio_epoch == epoch_before_abort + 1
+    conn.asr_audio_queue.gate.set()
+    assert await wait_for(lambda: conn.asr_audio_queue.empty())
+    assert rec == {"asr": [], "reports": [], "chats": []} and conn.asr_audio == []
+    # Immediate next turn on same connection WITHOUT re-sending listen.start (proves epoch-0 frames + stop did not pollute).
+    asr.next_text = "RECOVER_NO_START"
+    await route_frames(conn, frames17[:9])
+    await route_listen(conn, "stop")
+    assert await wait_for(lambda: len(rec["chats"]) == 1 and conn.asr_audio_queue.empty())
+    assert rec == {"asr": [1920 * 9], "reports": ["RECOVER_NO_START"], "chats": ["RECOVER_NO_START"]}, rec
+    # Next turn WITH listen.start.
+    asr.next_text = "RECOVER_WITH_START"
+    await route_listen(conn, "start", "manual")
+    await route_frames(conn, frames17[:11])
+    await route_listen(conn, "stop")
+    assert await wait_for(lambda: len(rec["chats"]) == 2 and conn.asr_audio_queue.empty())
+    assert rec == {
+        "asr": [1920 * 9, 1920 * 11],
+        "reports": ["RECOVER_NO_START", "RECOVER_WITH_START"],
+        "chats": ["RECOVER_NO_START", "RECOVER_WITH_START"],
+    }, rec
+    await shutdown_conn(conn)
+
+    # 5b. Pre-popped _QueuedListenStop fed directly to handleAudioMessage after abort is ignored.
+    install_spies()
+    conn, asr = await new_conn(cfg, rec, hold_worker=True, start_worker=False)
+    conn.client_listen_mode = "manual"
+    conn.asr_audio = [b"\\x01\\x00" * 960 for _ in range(17)]
+    conn.asr_audio_queue.put(b"\\x02\\x00" * 960)
+    await route_listen(conn, "stop")
+    conn.asr_audio_queue.gate.set()
+    _ = conn.asr_audio_queue.get_nowait()
+    pre_popped_stop = conn.asr_audio_queue.get_nowait()
+    await route_abort(conn)
+    await receive_audio_handle.handleAudioMessage(conn, pre_popped_stop)
+    assert rec == {"asr": [], "reports": [], "chats": []}, rec
+    assert asr.call_count == 0 and conn.asr_audio == []
+    await shutdown_conn(conn)
+
+    # 6. Connection close while stop is pending in HeldQueue + pre-popped marker + new connection recovery.
+    install_spies()
+    conn_cl, asr_cl = await new_conn(cfg, rec, hold_worker=True)
+    asr_cl.next_text = "STALE_PENDING_CLOSE"
+    await route_listen(conn_cl, "start", "manual")
+    await route_frames(conn_cl, frames17)
+    await route_listen(conn_cl, "stop")
+    # Also grab a real _QueuedListenStop marker before closing.
+    conn_helper, _ = await new_conn(cfg, rec, hold_worker=True, start_worker=False)
+    conn_helper.asr_audio_queue.put(b"\\x02\\x00" * 960)
+    await route_listen(conn_helper, "stop")
+    conn_helper.asr_audio_queue.gate.set()
+    _ = conn_helper.asr_audio_queue.get_nowait()
+    pre_popped_close_stop = conn_helper.asr_audio_queue.get_nowait()
+    await shutdown_conn(conn_helper)
+
+    await conn_cl.close()
+    conn_cl.asr_audio_queue.gate.set()
+    conn_cl.asr_priority_thread.join(timeout=2.0)
+    await receive_audio_handle.handleAudioMessage(conn_cl, pre_popped_close_stop)
+    assert asr_cl.call_count == 0 and rec == {"asr": [], "reports": [], "chats": []}, rec
+    assert conn_cl._passport_asr_task is None and conn_cl.asr_audio == []
+
+    # Fresh connection completes full manual turn with 0 wait.
+    install_spies()
+    conn_new, asr_new = await new_conn(cfg, rec, hold_worker=False)
+    asr_new.next_text = "FRESH_CONN_AFTER_CLOSE"
+    await route_listen(conn_new, "start", "manual")
+    await route_frames(conn_new, frames17)
+    await route_listen(conn_new, "stop")
+    assert await wait_for(lambda: len(rec["chats"]) == 1 and conn_new.asr_audio_queue.empty())
+    assert rec == {"asr": [expected17], "reports": ["FRESH_CONN_AFTER_CLOSE"], "chats": ["FRESH_CONN_AFTER_CLOSE"]}, rec
+    await shutdown_conn(conn_new)
+
+    # 7. Old-generation pending stop must NOT block or double-dispatch a subsequent listen.start round.
+    install_spies()
+    conn, asr = await new_conn(cfg, rec, hold_worker=True)
+    await route_listen(conn, "start", "manual")
+    await route_frames(conn, frames17)
+    await route_listen(conn, "stop")
+    # New turn starts while old frames + old stop are still held in queue.
+    asr.next_text = "NEW_GEN_ONLY"
+    await route_listen(conn, "start", "manual")
+    await route_frames(conn, frames17[:9])
+    await route_listen(conn, "stop")
+    conn.asr_audio_queue.gate.set()
+    assert await wait_for(lambda: len(rec["chats"]) == 1 and conn.asr_audio_queue.empty())
+    await asyncio.sleep(0.03)
+    assert rec == {"asr": [1920 * 9], "reports": ["NEW_GEN_ONLY"], "chats": ["NEW_GEN_ONLY"]}, rec
+    await shutdown_conn(conn)
+
+    # 8. Two back-to-back manual utterances in the SAME epoch without listen.start between them.
+    install_spies()
+    conn, asr = await new_conn(cfg, rec, hold_worker=False)
+    asr.next_text = "SAME_EPOCH_TWO_TURNS"
+    await route_listen(conn, "start", "manual")
+    await route_frames(conn, frames17)
+    await route_listen(conn, "stop")
+    await route_frames(conn, frames17[:9])
+    await route_listen(conn, "stop")
+    assert await wait_for(lambda: len(rec["chats"]) == 2 and conn.asr_audio_queue.empty())
+    assert rec["asr"] == [expected17, 1920 * 9], rec
+    assert pcm_len(conn.asr_audio) == 0
+    await shutdown_conn(conn)
+
+    # 9. Worker-less fallback: empty queue without audio thread dispatches buffered asr_audio directly.
+    install_spies()
+    conn_nw, asr_nw = await new_conn(cfg, rec, hold_worker=False, start_worker=False)
+    conn_nw.client_listen_mode = "manual"
+    conn_nw.asr_audio = [b"\\x01\\x00" * 960 for _ in range(17)]
+    await ListenTextMessageHandler().handle(conn_nw, {"session_id": conn_nw.session_id, "type": "listen", "state": "stop"})
+    assert conn_nw._passport_asr_task is not None
+    await asyncio.wait_for(conn_nw._passport_asr_task, 1.0)
+    assert rec == {"asr": [expected17], "reports": ["MANUAL_ORDER_OK"], "chats": ["MANUAL_ORDER_OK"]}, rec
+    await shutdown_conn(conn_nw)
+
+asyncio.run(run())
+"""
+        res = subprocess.run(
+            [sys.executable, "-c", probe_code],
+            env=_base_env(
+                XIAOZHI_HOME=str(srv_home),
+                PASSPORT_ROOT=str(ROOT),
+                PASSPORT_LOG_DIR=str(srv_home / "tmp"),
+                TEST_AUDIO_OUT=str(tmp / "asr_out"),
+            ),
+            capture_output=True,
+            text=True,
+            timeout=25,
+        )
+        assert res.returncode == 0, (
+            f"manual listen.stop queue ordering probe failed ({res.returncode}):\n{res.stdout}\n{res.stderr}"
+        )
+    print(
+        "[PASS] manual listen.stop FIFO queue ordering (full/partial backlog, 0-wait live worker, "
+        "pending abort/close invalidation, cross-epoch isolation, and worker-less fallback) verified"
+    )
+
+
 async def _ws_expect_rejected(ws_url: str, headers: dict, label: str) -> None:
     try:
         async with websockets.connect(ws_url, additional_headers=headers) as ws:
@@ -6458,24 +6887,8 @@ async def _send_vad_utterance(
         await ws.send(silence_frame)
 
 
-async def _run_vad_turn(
-    ws,
-    session_id: str,
-    mode: str,
-    speech_frames: list[bytes],
-    silence_frame: bytes,
-    timeout_s: float = 15.0,
-    send_listen_start: bool = True,
-) -> dict:
-    """Execute a complete VAD-triggered voice turn in auto or realtime mode and verify TTS completion."""
-    await _send_vad_utterance(
-        ws,
-        session_id,
-        mode,
-        speech_frames,
-        silence_frame,
-        send_listen_start=send_listen_start,
-    )
+async def _collect_ws_turn_response(ws, timeout_s: float = 15.0) -> dict:
+    """Collect STT, TTS states, and decoded TTS PCM byte count until tts.stop."""
     texts: list[str] = []
     tts_states: list[str] = []
     decoded = 0
@@ -6499,6 +6912,27 @@ async def _run_vad_turn(
             if msg.get("state") == "stop":
                 break
     return {"stt": texts, "tts_states": tts_states, "decoded_pcm_bytes": decoded}
+
+
+async def _run_vad_turn(
+    ws,
+    session_id: str,
+    mode: str,
+    speech_frames: list[bytes],
+    silence_frame: bytes,
+    timeout_s: float = 15.0,
+    send_listen_start: bool = True,
+) -> dict:
+    """Execute a complete VAD-triggered voice turn in auto or realtime mode and verify TTS completion."""
+    await _send_vad_utterance(
+        ws,
+        session_id,
+        mode,
+        speech_frames,
+        silence_frame,
+        send_listen_start=send_listen_start,
+    )
+    return await _collect_ws_turn_response(ws, timeout_s=timeout_s)
 
 
 async def _run_live_server_regressions(
@@ -7197,6 +7631,210 @@ async def _run_live_server_regressions(
                 stats_after_pdr = _get_json(f"{fake_url}/_stats")
                 assert int(stats_after_pdr["asr_total"]) == asr_before_pd + 1
                 assert int(stats_after_pdr["llm_total"]) == llm_before_pd + 1
+
+        # 3j. Manual listen.stop queue ordering on the live server (0-sleep frame bursts,
+        #     partial backlog, pending abort invalidation + same-session recovery, and
+        #     pending close invalidation + reconnect recovery).
+        manual_frames_17 = opus_frames(17)
+        expected_17_bytes = 1920 * 17
+        async with websockets.connect(ws_url, additional_headers=headers_a) as ws_man:
+            hello_man = await send_hello(ws_man)
+            sid_man = hello_man["session_id"]
+
+            # (i) Full burst with 0 sleep before stop -> single ASR call receives all 32,640 bytes.
+            post_json(f"{fake_url}/_control", {}, {"asr_delays": [0.0], "transcript": "MANUAL_LIVE_FULL"})
+            st_before_m1 = _get_json(f"{fake_url}/_stats")
+            prev_id_m1 = max((r["id"] for r in st_before_m1["asr_requests"]), default=0)
+            asr_before_m1 = int(st_before_m1["asr_total"])
+            llm_before_m1 = int(st_before_m1["llm_total"])
+
+            await ws_man.send(
+                json.dumps({"session_id": sid_man, "type": "listen", "state": "start", "mode": "manual"})
+            )
+            for frame in manual_frames_17:
+                await ws_man.send(frame)
+            await ws_man.send(json.dumps({"session_id": sid_man, "type": "listen", "state": "stop"}))
+
+            turn_m1 = await _collect_ws_turn_response(ws_man)
+            assert "MANUAL_LIVE_FULL" in "".join(turn_m1["stt"]), turn_m1
+            assert turn_m1["decoded_pcm_bytes"] > 0 and "stop" in turn_m1["tts_states"], turn_m1
+            st_after_m1 = _get_json(f"{fake_url}/_stats")
+            reqs_m1 = [r for r in st_after_m1["asr_requests"] if r["id"] > prev_id_m1]
+            assert int(st_after_m1["asr_total"]) == asr_before_m1 + 1, st_after_m1
+            assert int(st_after_m1["llm_total"]) == llm_before_m1 + 1, st_after_m1
+            assert len(reqs_m1) == 1 and reqs_m1[0]["pcm_bytes"] == expected_17_bytes, reqs_m1
+
+            # (ii) Partial drain (10 frames digested, then 7 tail frames + immediate 0-sleep stop)
+            #      -> single ASR call receives full 32,640 bytes and duplicate stop triggers nothing.
+            post_json(f"{fake_url}/_control", {}, {"asr_delays": [0.0], "transcript": "MANUAL_LIVE_PARTIAL"})
+            st_before_m2 = _get_json(f"{fake_url}/_stats")
+            prev_id_m2 = max((r["id"] for r in st_before_m2["asr_requests"]), default=0)
+            asr_before_m2 = int(st_before_m2["asr_total"])
+            llm_before_m2 = int(st_before_m2["llm_total"])
+
+            await ws_man.send(
+                json.dumps({"session_id": sid_man, "type": "listen", "state": "start", "mode": "manual"})
+            )
+            for frame in manual_frames_17[:10]:
+                await ws_man.send(frame)
+            await asyncio.sleep(0.12)
+            for frame in manual_frames_17[10:]:
+                await ws_man.send(frame)
+            await ws_man.send(json.dumps({"session_id": sid_man, "type": "listen", "state": "stop"}))
+
+            turn_m2 = await _collect_ws_turn_response(ws_man)
+            assert "MANUAL_LIVE_PARTIAL" in "".join(turn_m2["stt"]), turn_m2
+            assert turn_m2["decoded_pcm_bytes"] > 0 and "stop" in turn_m2["tts_states"], turn_m2
+            st_after_m2 = _get_json(f"{fake_url}/_stats")
+            reqs_m2 = [r for r in st_after_m2["asr_requests"] if r["id"] > prev_id_m2]
+            assert int(st_after_m2["asr_total"]) == asr_before_m2 + 1, st_after_m2
+            assert int(st_after_m2["llm_total"]) == llm_before_m2 + 1, st_after_m2
+            assert len(reqs_m2) == 1 and reqs_m2[0]["pcm_bytes"] == expected_17_bytes, reqs_m2
+
+            await ws_man.send(json.dumps({"session_id": sid_man, "type": "listen", "state": "stop"}))
+            await asyncio.sleep(0.25)
+            st_dup_m2 = _get_json(f"{fake_url}/_stats")
+            assert int(st_dup_m2["asr_total"]) == asr_before_m2 + 1, st_dup_m2
+            assert int(st_dup_m2["llm_total"]) == llm_before_m2 + 1, st_dup_m2
+
+            # (iii) Immediate abort after stop invalidates pending/in-flight stop; same session recovers cleanly.
+            stale_man_abort = "STALE_MANUAL_PENDING_ABORT"
+            llm_before_m3 = int(_get_json(f"{fake_url}/_stats")["llm_total"])
+            post_json(
+                f"{fake_url}/_control",
+                {},
+                {"asr_delays": [15.0], "transcript": stale_man_abort},
+            )
+            await ws_man.send(
+                json.dumps({"session_id": sid_man, "type": "listen", "state": "start", "mode": "manual"})
+            )
+            for frame in manual_frames_17:
+                await ws_man.send(frame)
+            await ws_man.send(json.dumps({"session_id": sid_man, "type": "listen", "state": "stop"}))
+            await ws_man.send(
+                json.dumps({"session_id": sid_man, "type": "abort", "reason": "wake_word_detected"})
+            )
+
+            stop_deadline_m3 = time.monotonic() + 1.5
+            stop_seen_m3 = False
+            while time.monotonic() < stop_deadline_m3:
+                rem = max(0.01, stop_deadline_m3 - time.monotonic())
+                raw_msg = await asyncio.wait_for(ws_man.recv(), rem)
+                if isinstance(raw_msg, bytes):
+                    continue
+                assert stale_man_abort not in raw_msg, f"manual abort leaked stale text: {raw_msg!r}"
+                parsed_msg = json.loads(raw_msg)
+                if parsed_msg.get("type") == "tts" and parsed_msg.get("state") == "stop":
+                    stop_seen_m3 = True
+                    break
+            assert stop_seen_m3, "manual abort after pending stop did not receive tts.stop"
+
+            t_m3_clear = time.monotonic()
+            while time.monotonic() - t_m3_clear < 1.2:
+                if int(_get_json(f"{fake_url}/_stats")["asr_in_flight"]) == 0:
+                    break
+                await asyncio.sleep(0.03)
+            else:
+                raise AssertionError("manual abort left ASR request in flight")
+
+            obs_end_m3 = time.monotonic() + 0.3
+            while time.monotonic() < obs_end_m3:
+                rem = max(0.01, obs_end_m3 - time.monotonic())
+                try:
+                    extra = await asyncio.wait_for(ws_man.recv(), rem)
+                except asyncio.TimeoutError:
+                    break
+                if isinstance(extra, str):
+                    assert stale_man_abort not in extra, f"manual abort leaked stale text: {extra!r}"
+            assert int(_get_json(f"{fake_url}/_stats")["llm_total"]) == llm_before_m3
+
+            # Same-connection recovery without re-sending listen.start (verifies zero stale buffered bytes).
+            post_json(f"{fake_url}/_control", {}, {"asr_delays": [0.0], "transcript": "MANUAL_POST_ABORT_OK"})
+            st_pre_rec3 = _get_json(f"{fake_url}/_stats")
+            prev_id_rec3 = max((r["id"] for r in st_pre_rec3["asr_requests"]), default=0)
+            for frame in manual_frames_17[:11]:
+                await ws_man.send(frame)
+            await ws_man.send(json.dumps({"session_id": sid_man, "type": "listen", "state": "stop"}))
+            turn_rec3 = await _collect_ws_turn_response(ws_man)
+            assert "MANUAL_POST_ABORT_OK" in "".join(turn_rec3["stt"]), turn_rec3
+            assert turn_rec3["decoded_pcm_bytes"] > 0 and "stop" in turn_rec3["tts_states"], turn_rec3
+            st_post_rec3 = _get_json(f"{fake_url}/_stats")
+            reqs_rec3 = [r for r in st_post_rec3["asr_requests"] if r["id"] > prev_id_rec3]
+            assert int(st_post_rec3["llm_total"]) == llm_before_m3 + 1, st_post_rec3
+            assert len(reqs_rec3) == 1 and reqs_rec3[0]["pcm_bytes"] == 1920 * 11, reqs_rec3
+
+        # (iv) Immediate disconnect after stop invalidates pending/in-flight stop; reconnect recovers cleanly.
+        llm_before_m4 = int(_get_json(f"{fake_url}/_stats")["llm_total"])
+        post_json(
+            f"{fake_url}/_control",
+            {},
+            {"asr_delays": [15.0], "transcript": "STALE_MANUAL_PENDING_DISC"},
+        )
+        ws_man_disc = await websockets.connect(ws_url, additional_headers=headers_a)
+        try:
+            hello_md = await send_hello(ws_man_disc)
+            await ws_man_disc.send(
+                json.dumps(
+                    {
+                        "session_id": hello_md["session_id"],
+                        "type": "listen",
+                        "state": "start",
+                        "mode": "manual",
+                    }
+                )
+            )
+            for frame in manual_frames_17:
+                await ws_man_disc.send(frame)
+            await ws_man_disc.send(
+                json.dumps({"session_id": hello_md["session_id"], "type": "listen", "state": "stop"})
+            )
+            if ws_man_disc.transport is not None:
+                ws_man_disc.transport.abort()
+            else:
+                await ws_man_disc.close()
+        finally:
+            if ws_man_disc.transport is not None and not ws_man_disc.transport.is_closing():
+                ws_man_disc.transport.abort()
+
+        t_m4_clear = time.monotonic()
+        while time.monotonic() - t_m4_clear < 1.5:
+            if int(_get_json(f"{fake_url}/_stats")["asr_in_flight"]) == 0:
+                break
+            await asyncio.sleep(0.03)
+        else:
+            raise AssertionError("manual disconnect left ASR request in flight")
+        await asyncio.sleep(0.4)
+        st_after_md = _get_json(f"{fake_url}/_stats")
+        assert int(st_after_md["llm_total"]) == llm_before_m4, st_after_md
+        assert int(st_after_md["asr_in_flight"]) == 0, st_after_md
+
+        post_json(f"{fake_url}/_control", {}, {"asr_delays": [0.0], "transcript": "MANUAL_RECONNECT_OK"})
+        st_pre_rec4 = _get_json(f"{fake_url}/_stats")
+        prev_id_rec4 = max((r["id"] for r in st_pre_rec4["asr_requests"]), default=0)
+        async with websockets.connect(ws_url, additional_headers=headers_a) as ws_man_rec:
+            hello_mr = await send_hello(ws_man_rec)
+            await ws_man_rec.send(
+                json.dumps(
+                    {
+                        "session_id": hello_mr["session_id"],
+                        "type": "listen",
+                        "state": "start",
+                        "mode": "manual",
+                    }
+                )
+            )
+            for frame in manual_frames_17[:13]:
+                await ws_man_rec.send(frame)
+            await ws_man_rec.send(
+                json.dumps({"session_id": hello_mr["session_id"], "type": "listen", "state": "stop"})
+            )
+            turn_rec4 = await _collect_ws_turn_response(ws_man_rec)
+            assert "MANUAL_RECONNECT_OK" in "".join(turn_rec4["stt"]), turn_rec4
+            assert turn_rec4["decoded_pcm_bytes"] > 0 and "stop" in turn_rec4["tts_states"], turn_rec4
+        st_post_rec4 = _get_json(f"{fake_url}/_stats")
+        reqs_rec4 = [r for r in st_post_rec4["asr_requests"] if r["id"] > prev_id_rec4]
+        assert int(st_post_rec4["llm_total"]) == llm_before_m4 + 1, st_post_rec4
+        assert len(reqs_rec4) == 1 and reqs_rec4[0]["pcm_bytes"] == 1920 * 13, reqs_rec4
     finally:
         post_json(f"{fake_url}/_control", {}, {"asr_delays": [], "transcript": "合约测试"})
 
@@ -8002,6 +8640,7 @@ def main() -> None:
             _wait_for_http_ready(f"http://127.0.0.1:{fake_port}/_stats", fake_proc, fake_log)
             test_async_asr_nonblocking_disk_io(server_home, fake_port)
             test_auto_realtime_asr_cancel_unit(server_home)
+            test_manual_listen_stop_queue_ordering_unit(server_home)
 
             with open(server_stdout_log, "w", encoding="utf-8") as sout:
                 server_proc = subprocess.Popen(
