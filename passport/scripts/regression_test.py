@@ -8,6 +8,7 @@ never logs or prints raw experimental tokens/secrets.
 
 import asyncio
 import base64
+import errno
 import hashlib
 import http.client
 import json
@@ -104,6 +105,214 @@ def _free_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.bind(("127.0.0.1", 0))
         return int(sock.getsockname()[1])
+
+
+def _reserve_distinct_ports(count: int) -> list[int]:
+    """Reserve `count` pairwise-distinct loopback TCP ports simultaneously before closing."""
+    sockets: list[socket.socket] = []
+    ports: list[int] = []
+    seen: set[int] = set()
+    try:
+        while len(ports) < count:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.bind(("127.0.0.1", 0))
+            port = int(sock.getsockname()[1])
+            if port in seen:
+                sock.close()
+                continue
+            seen.add(port)
+            sockets.append(sock)
+            ports.append(port)
+        return ports
+    finally:
+        for sock in sockets:
+            try:
+                sock.close()
+            except OSError:
+                pass
+
+
+class _ReservedPortPool:
+    """Hold loopback ports simultaneously so dead upstreams and listen ports cannot collide."""
+
+    def __init__(self) -> None:
+        self._ports: dict[str, int] = {}
+        self._by_port: dict[int, str] = {}
+        self._dead_sockets: dict[str, socket.socket] = {}
+        self._listen_sockets: dict[str, socket.socket] = {}
+
+    def __enter__(self) -> "_ReservedPortPool":
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self.close()
+
+    def _record_unique(self, label: str, port: int) -> None:
+        assert label not in self._ports, f"Duplicate port label: {label}"
+        assert port not in self._by_port, (
+            f"Port collision between {label} and {self._by_port[port]} on 127.0.0.1:{port}"
+        )
+        self._ports[label] = port
+        self._by_port[port] = label
+
+    def register_external(self, label: str, port: int) -> int:
+        self._record_unique(label, int(port))
+        return int(port)
+
+    def _bind_new(self, label: str) -> tuple[socket.socket, int]:
+        for _ in range(32):
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.bind(("127.0.0.1", 0))
+            port = int(sock.getsockname()[1])
+            if port not in self._by_port:
+                self._record_unique(label, port)
+                return sock, port
+            sock.close()
+        raise RuntimeError(f"Failed to allocate unique loopback port for {label}")
+
+    def reserve_dead(self, label: str) -> int:
+        """Bind (without listen) and hold a port for the entire fixture so nothing can bind/listen on it."""
+        sock, port = self._bind_new(label)
+        self._dead_sockets[label] = sock
+        return port
+
+    def reserve_listen(self, label: str) -> int:
+        """Bind and hold a listen port until release_listen_ports() immediately before proxy start."""
+        sock, port = self._bind_new(label)
+        self._listen_sockets[label] = sock
+        return port
+
+    def release_listen_ports(self) -> None:
+        """Release held listen-port placeholders right before starting the proxy; dead ports stay held."""
+        for label in list(self._listen_sockets.keys()):
+            sock = self._listen_sockets.pop(label)
+            try:
+                sock.close()
+            except OSError:
+                pass
+
+    def assert_dead_ports_unreachable(self, context: str = "") -> None:
+        prefix = f"{context}: " if context else ""
+        for label, sock in self._dead_sockets.items():
+            port = self._ports[label]
+            assert sock.fileno() != -1, f"{prefix}dead socket {label} (port {port}) was closed early"
+            assert sock.getsockname() == ("127.0.0.1", port), (
+                f"{prefix}dead socket {label} moved from {port} to {sock.getsockname()}"
+            )
+            probe_bind = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            probe_bind.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            try:
+                try:
+                    probe_bind.bind(("127.0.0.1", port))
+                except OSError as exc:
+                    assert exc.errno == errno.EADDRINUSE, (
+                        f"{prefix}unexpected errno on probe bind for dead port {label}={port}: {exc}"
+                    )
+                else:
+                    raise AssertionError(
+                        f"{prefix}dead port {label}={port} was rebindable during fixture"
+                    )
+            finally:
+                probe_bind.close()
+
+            try:
+                conn = socket.create_connection(("127.0.0.1", port), timeout=1.0)
+            except OSError as exc:
+                assert exc.errno == errno.ECONNREFUSED, (
+                    f"{prefix}dead port {label}={port} failed with {exc.errno} instead of ECONNREFUSED"
+                )
+            else:
+                conn.close()
+                raise AssertionError(f"{prefix}dead port {label}={port} unexpectedly accepted TCP connection")
+
+    def assert_all_disjoint(self, context: str = "") -> None:
+        prefix = f"{context}: " if context else ""
+        assert len(self._ports) == len(set(self._ports.values())), (
+            f"{prefix}port collision detected in {self._ports}"
+        )
+        self.assert_dead_ports_unreachable(context)
+
+    def port_map(self) -> dict[str, int]:
+        return dict(self._ports)
+
+    def dead_hold_state(self) -> dict[str, bool]:
+        return {label: (sock.fileno() != -1) for label, sock in self._dead_sockets.items()}
+
+    def close(self) -> None:
+        self.release_listen_ports()
+        for label in list(self._dead_sockets.keys()):
+            sock = self._dead_sockets.pop(label)
+            try:
+                sock.close()
+            except OSError:
+                pass
+
+
+def _redact_proxy_diag(text: str, forbidden_secrets: set[str]) -> str:
+    """Scrub synthetic/live OTA secrets, tokens, and URLs before saving failure diagnostics."""
+    out = str(text or "")
+    for secret_val in sorted((s for s in forbidden_secrets if s and len(s) >= 6), key=len, reverse=True):
+        out = out.replace(secret_val, "[REDACTED]")
+    out = re.sub(r"/xiaozhi/ota/d/[^/\s\"'?]+", "/xiaozhi/ota/d/[REDACTED]", out)
+    return redact_text(out)
+
+
+def _save_proxy_failure_diag(
+    fixture: str,
+    *,
+    port_map: dict[str, int],
+    dead_hold_state: dict[str, bool],
+    last_response: Optional[dict],
+    log_files: dict[str, Path],
+    extra_logs: Optional[dict[str, str]],
+    forbidden_secrets: set[str],
+    error: BaseException,
+    diag_dir: Optional[Path] = None,
+) -> Path:
+    """Persist redacted port mappings, last HTTP response, and error logs on proxy fixture failure."""
+    safe_last: Optional[dict] = None
+    if last_response:
+        safe_last = {
+            "label": str(last_response.get("label", "")),
+            "port": last_response.get("port"),
+            "method": str(last_response.get("method", "")),
+            "path": _redact_proxy_diag(str(last_response.get("path", "")), forbidden_secrets),
+            "status": last_response.get("status"),
+            "body_preview": _redact_proxy_diag(
+                str(last_response.get("body_preview", ""))[:512], forbidden_secrets
+            ),
+        }
+
+    redacted_logs: dict[str, str] = {}
+    for name, log_path in log_files.items():
+        if log_path.is_file():
+            raw = log_path.read_text(encoding="utf-8", errors="replace")
+            if raw:
+                redacted_logs[name] = _redact_proxy_diag(raw[-4000:], forbidden_secrets)
+    for name, raw_text in (extra_logs or {}).items():
+        if raw_text:
+            redacted_logs[name] = _redact_proxy_diag(raw_text[-4000:], forbidden_secrets)
+
+    payload = {
+        "fixture": fixture,
+        "error_type": type(error).__name__,
+        "error": _redact_proxy_diag(str(error), forbidden_secrets),
+        "ports": port_map,
+        "dead_ports_held": dead_hold_state,
+        "last_response": safe_last,
+        "error_logs": redacted_logs,
+    }
+    serialized = json.dumps(payload, ensure_ascii=False, indent=2)
+    for secret_val in forbidden_secrets:
+        if secret_val and len(secret_val) >= 6:
+            assert secret_val not in serialized, "Proxy diagnostic redaction failed on secret literal"
+    assert "/xiaozhi/ota/d/" not in serialized.replace("/xiaozhi/ota/d/[REDACTED]", ""), (
+        "Proxy diagnostic redaction left raw /xiaozhi/ota/d/ path"
+    )
+    target_dir = diag_dir or Path(tempfile.gettempdir())
+    out_path = target_dir / f"passport-{fixture}-failure-{os.getpid()}-{int(time.time())}.json"
+    atomic_write_private(out_path, serialized, mode=0o600)
+    return out_path
 
 
 def _get_json(url: str) -> dict:
@@ -243,7 +452,7 @@ def _start_counting_upstream():
         def do_POST(self):
             self._handle("POST")
 
-    srv = ThreadingHTTPServer(("127.0.0.1", _free_port()), _CountingHandler)
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), _CountingHandler)
     srv.daemon_threads = True
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     return srv, int(srv.server_address[1]), hits, hit_lock
@@ -460,6 +669,68 @@ def test_unit_redaction_permissions_and_strict_abort() -> None:
         finally:
             os.umask(old_umask)
     print("[PASS] unit tests: redaction, stdlib propagation, missing-log fail gate, strict abort gate, atomic 0600 write")
+
+
+def test_port_fixture_mutual_exclusion_and_diag_redaction() -> None:
+    """Verify _ReservedPortPool enforces non-overlapping ports, holds dead ports, and redacts failure diagnostics."""
+    live_srv, live_port, _, _ = _start_counting_upstream()
+    try:
+        with _ReservedPortPool() as pool:
+            pool.register_external("counting_live", live_port)
+            dead_port = pool.reserve_dead("dead_upstream")
+            listen_ports = [pool.reserve_listen(f"listen_{idx}") for idx in range(40)]
+            all_ports = [live_port, dead_port, *listen_ports]
+            assert len(all_ports) == len(set(all_ports)) == 42
+            pool.assert_all_disjoint("unit_pool_all_held")
+
+            pool.release_listen_ports()
+            pool.assert_dead_ports_unreachable("unit_pool_after_release_listen")
+
+            syn_secret = "diag_ota_" + secrets.token_hex(12)
+            syn_q = "diag_q_" + secrets.token_hex(10)
+            syn_tok = "diag_bearer_" + secrets.token_hex(10)
+            with tempfile.TemporaryDirectory() as tmpdir:
+                tmp = Path(tmpdir)
+                err_file = tmp / "dead_err.log"
+                err_file.write_text(
+                    f'connect() failed upstream: "http://127.0.0.1:{dead_port}/xiaozhi/ota/d/{syn_secret}/", '
+                    f'referrer: "https://passport.example/?token={syn_q}"\n',
+                    encoding="utf-8",
+                )
+                diag_path = _save_proxy_failure_diag(
+                    "unit-test",
+                    port_map=pool.port_map(),
+                    dead_hold_state=pool.dead_hold_state(),
+                    last_response={
+                        "label": "p_dead",
+                        "port": dead_port,
+                        "method": "POST",
+                        "path": f"/xiaozhi/ota/d/{syn_secret}/?token={syn_q}",
+                        "status": 502,
+                        "body_preview": f"Authorization: Bearer {syn_tok}",
+                    },
+                    log_files={"dead_error": err_file},
+                    extra_logs={"stderr": f"Bearer {syn_tok}"},
+                    forbidden_secrets={syn_secret, syn_q, syn_tok},
+                    error=RuntimeError(f"failed hitting /xiaozhi/ota/d/{syn_secret}/"),
+                    diag_dir=tmp,
+                )
+                assert stat.S_IMODE(diag_path.stat().st_mode) == 0o600
+                diag_raw = diag_path.read_text(encoding="utf-8")
+                diag_obj = json.loads(diag_raw)
+                assert diag_obj["dead_ports_held"] == {"dead_upstream": True}
+                assert diag_obj["ports"]["dead_upstream"] == dead_port
+                assert diag_obj["last_response"]["status"] == 502
+                assert "dead_error" in diag_obj["error_logs"]
+                for secret_val in (syn_secret, syn_q, syn_tok):
+                    assert secret_val not in diag_raw
+                assert f"/xiaozhi/ota/d/{syn_secret}" not in diag_raw
+                assert "/xiaozhi/ota/d/[REDACTED]" in diag_raw
+    finally:
+        live_srv.shutdown()
+        live_srv.server_close()
+
+    print("[PASS] unit tests: port fixture mutual exclusion, held dead port, and redacted failure diagnostics")
 
 
 def test_concurrent_registry_locking_and_auth_key() -> None:
@@ -788,10 +1059,11 @@ def test_real_mode_refuses_disabled_or_missing_auth(server_home: Path) -> None:
         )
 
         def _write_cfg(path: Path, auth_obj, include_auth: bool = True, auth_key: Optional[str] = None) -> None:
+            ws_p, http_p = _reserve_distinct_ports(2)
             server_block = {
                 "ip": "127.0.0.1",
-                "port": _free_port(),
-                "http_port": _free_port(),
+                "port": ws_p,
+                "http_port": http_p,
                 "websocket": "wss://passport.real.example/xiaozhi/v1/",
                 "vision_explain": "https://passport.real.example/mcp/vision/explain",
             }
@@ -1070,9 +1342,7 @@ def test_real_vs_demo_config_persistence(server_home: Path) -> None:
         assert demo_rendered["ASR"]["PassportLocalASR"]["base_url"] == "http://127.0.0.1:19999/v1/audio/transcriptions"
 
         # 4d. End-to-end real-mode launch via entrypoint.sh -> SIGTERM -> restart keeps real providers.
-        e2e_provider_port = _free_port()
-        e2e_ws_port = _free_port()
-        e2e_http_port = _free_port()
+        e2e_provider_port, e2e_ws_port, e2e_http_port = _reserve_distinct_ports(3)
         e2e_home = _make_srv_home(server_home, tmp / "e2e_real_home")
 
         e2e_devices = tmp / "e2e_devices.yaml"
@@ -1503,15 +1773,16 @@ def test_demo_isolation_preserves_real_state(server_home: Path) -> None:
         # Exercise default $ROOT/runtime-demo by leaving PASSPORT_DEMO_RUNTIME unset.
         # pip runs (offline "already satisfied" via the read-only shared venv) so
         # the test proves dependency installation never writes the shared venv.
+        demo_ws_p, demo_http_p, demo_fake_p = _reserve_distinct_ports(3)
         demo_res = subprocess.run(
             ["sh", str(passport_copy / "scripts" / "run_isolated.sh")],
             env=_base_env(
                 PASSPORT_SKIP_REGRESSION="1",
                 PASSPORT_PYTHON=sys.executable,
                 PASSPORT_AUTH_KEY=synthetic_real_key,
-                PASSPORT_WS_BIND_PORT=str(_free_port()),
-                PASSPORT_HTTP_BIND_PORT=str(_free_port()),
-                PASSPORT_FAKE_PORT=str(_free_port()),
+                PASSPORT_WS_BIND_PORT=str(demo_ws_p),
+                PASSPORT_HTTP_BIND_PORT=str(demo_http_p),
+                PASSPORT_FAKE_PORT=str(demo_fake_p),
             ),
             capture_output=True,
             text=True,
@@ -1610,15 +1881,16 @@ def test_demo_isolation_preserves_real_state(server_home: Path) -> None:
         (demo_root / ".devices.yaml.lock").unlink()
         (demo_root / ".devices.yaml.lock").symlink_to(real_dev_lock_sentinel)
 
+        reuse_ws_p, reuse_http_p, reuse_fake_p = _reserve_distinct_ports(3)
         reuse_res = subprocess.run(
             ["sh", str(passport_copy / "scripts" / "run_isolated.sh")],
             env=_base_env(
                 PASSPORT_SKIP_REGRESSION="1",
                 PASSPORT_PYTHON=sys.executable,
                 PASSPORT_AUTH_KEY=synthetic_real_key,
-                PASSPORT_WS_BIND_PORT=str(_free_port()),
-                PASSPORT_HTTP_BIND_PORT=str(_free_port()),
-                PASSPORT_FAKE_PORT=str(_free_port()),
+                PASSPORT_WS_BIND_PORT=str(reuse_ws_p),
+                PASSPORT_HTTP_BIND_PORT=str(reuse_http_p),
+                PASSPORT_FAKE_PORT=str(reuse_fake_p),
             ),
             capture_output=True,
             text=True,
@@ -1964,9 +2236,9 @@ def test_demo_pip_controlled_install_isolation(server_home: Path) -> None:
                 PIP_ROOT=str(sim_shared_venv),
                 PIP_USER="1",
                 PIP_PYTHON=str(sim_shared_venv / "bin" / "python"),
-                PASSPORT_WS_BIND_PORT=str(_free_port()),
-                PASSPORT_HTTP_BIND_PORT=str(_free_port()),
-                PASSPORT_FAKE_PORT=str(_free_port()),
+                PASSPORT_WS_BIND_PORT=str((pip_ports := _reserve_distinct_ports(3))[0]),
+                PASSPORT_HTTP_BIND_PORT=str(pip_ports[1]),
+                PASSPORT_FAKE_PORT=str(pip_ports[2]),
             ),
             capture_output=True,
             text=True,
@@ -2108,9 +2380,9 @@ def test_demo_pip_controlled_install_isolation(server_home: Path) -> None:
                 PIP_ROOT=str(fresh_decoy_target),
                 PIP_USER="1",
                 PIP_PYTHON=sys.executable,
-                PASSPORT_WS_BIND_PORT=str(_free_port()),
-                PASSPORT_HTTP_BIND_PORT=str(_free_port()),
-                PASSPORT_FAKE_PORT=str(_free_port()),
+                PASSPORT_WS_BIND_PORT=str((fresh_ports := _reserve_distinct_ports(3))[0]),
+                PASSPORT_HTTP_BIND_PORT=str(fresh_ports[1]),
+                PASSPORT_FAKE_PORT=str(fresh_ports[2]),
             ),
             capture_output=True,
             text=True,
@@ -2870,8 +3142,8 @@ def test_reverse_proxy_templates_and_forwarding(ota_base: str, dev_a: dict) -> N
         def do_POST(self):
             self._handle("POST")
 
-    proxy_port = _free_port()
-    proxy_srv = ThreadingHTTPServer(("127.0.0.1", proxy_port), _TemplateProxyHandler)
+    proxy_srv = ThreadingHTTPServer(("127.0.0.1", 0), _TemplateProxyHandler)
+    proxy_port = int(proxy_srv.server_address[1])
     proxy_srv.daemon_threads = True
     proxy_thread = threading.Thread(target=proxy_srv.serve_forever, daemon=True)
     proxy_thread.start()
@@ -3076,7 +3348,7 @@ def test_reverse_proxy_templates_and_forwarding(ota_base: str, dev_a: dict) -> N
             def do_POST(self):
                 self._handle("POST")
 
-        c_srv = ThreadingHTTPServer(("127.0.0.1", _free_port()), _TemplateCaddyHandler)
+        c_srv = ThreadingHTTPServer(("127.0.0.1", 0), _TemplateCaddyHandler)
         c_srv.daemon_threads = True
         threading.Thread(target=c_srv.serve_forever, daemon=True).start()
         return c_srv, f"http://127.0.0.1:{c_srv.server_address[1]}", upstream_hits, access_sink, global_sinks
@@ -3935,17 +4207,20 @@ def test_proxy_runtime_error_logs_redacted() -> None:
     Round-3 letter-percent-encoding bypass, server-guard removal leak, and
     `if=$passport_log_access` removal leak under access-log write failure.
     """
+    with _ReservedPortPool() as port_pool:
+        dead_port = port_pool.reserve_dead("standin_dead_upstream")
+        port_pool.assert_dead_ports_unreachable("standin_proxy_init")
+        _run_proxy_runtime_error_logs_redacted(dead_port, port_pool)
+
+
+def _run_proxy_runtime_error_logs_redacted(dead_port: int, port_pool: _ReservedPortPool) -> None:
     caddy_text = (ROOT / "proxy" / "Caddyfile.example").read_text(encoding="utf-8")
     nginx_text = (ROOT / "proxy" / "nginx-passport.conf.example").read_text(encoding="utf-8")
     syn = "errlog_ota_" + secrets.token_hex(12)
-    dead_port = _free_port()  # nothing listens here -> connection refused
 
     def _upstream_fails() -> bool:
-        try:
-            socket.create_connection(("127.0.0.1", dead_port), timeout=1).close()
-            return False
-        except OSError:
-            return True
+        port_pool.assert_dead_ports_unreachable("standin_upstream_probe")
+        return True
 
     caddy_re_m = re.search(r"path_regexp\s+ota\s+(\S+)", caddy_text)
     assert caddy_re_m
@@ -4144,7 +4419,7 @@ def test_proxy_runtime_error_logs_redacted() -> None:
 
     def _drive(flavor: str, template: str, sinks, requests_spec, *, access_log_write_fail: bool = False) -> list[int]:
         srv = ThreadingHTTPServer(
-            ("127.0.0.1", _free_port()),
+            ("127.0.0.1", 0),
             _make_handler(flavor, template, sinks, access_log_write_fail=access_log_write_fail),
         )
         srv.daemon_threads = True
@@ -4541,33 +4816,57 @@ def test_real_nginx_log_isolation(ota_base: str, dev_a: dict) -> set[str]:
 
     live_http_port = urlsplit(ota_base).port
     assert live_http_port is not None
-    dead_port = _free_port()
     syn = "realnginx_ota_" + secrets.token_hex(12)
     q_syn = "realnginx_q_" + secrets.token_hex(10)
     benign_q = "realnginx_benign_" + secrets.token_hex(8)
     issued_tokens: set[str] = set()
+    forbidden_all: set[str] = {syn, q_syn, benign_q, dev_a["ota_secret"]}
+    last_response: dict = {}
 
-    def _raw_http(port: int, method: str, path: str, *, headers: Optional[dict[str, str]] = None, body: Optional[bytes] = None) -> tuple[int, bytes]:
+    def _raw_http(
+        port: int,
+        method: str,
+        path: str,
+        *,
+        headers: Optional[dict[str, str]] = None,
+        body: Optional[bytes] = None,
+        label: str = "",
+    ) -> tuple[int, bytes]:
         conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
         try:
             hdrs = {"Connection": "close", **(headers or {})}
             conn.request(method, path, body=body, headers=hdrs)
             resp = conn.getresponse()
             data = resp.read()
+            last_response.clear()
+            last_response.update(
+                {
+                    "label": label or str(port),
+                    "port": port,
+                    "method": method,
+                    "path": path,
+                    "status": resp.status,
+                    "body_preview": data.decode("utf-8", "replace")[:512],
+                }
+            )
             return resp.status, data
         finally:
             conn.close()
 
     cnt_srv, cnt_port, cnt_hits, cnt_lock = _start_counting_upstream()
     try:
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with tempfile.TemporaryDirectory() as tmpdir, _ReservedPortPool() as port_pool:
             tmp = Path(tmpdir)
             for d in ("client_body_temp", "proxy_temp", "fastcgi_temp", "uwsgi_temp", "scgi_temp"):
                 (tmp / d).mkdir()
 
-            p_count = _free_port()
-            p_live = _free_port()
-            p_dead = _free_port()
+            port_pool.register_external("live_ota_http", live_http_port)
+            port_pool.register_external("counting_upstream", cnt_port)
+            dead_port = port_pool.reserve_dead("dead_upstream")
+            p_count = port_pool.reserve_listen("nginx_count")
+            p_live = port_pool.reserve_listen("nginx_live")
+            p_dead = port_pool.reserve_listen("nginx_dead")
+
             cnt_acc = tmp / "cnt_access.log"
             cnt_err = tmp / "cnt_error.log"
             live_acc = tmp / "live_access.log"
@@ -4669,7 +4968,7 @@ def test_real_nginx_log_isolation(ota_base: str, dev_a: dict) -> set[str]:
                     ("neg_legacy_path_twodot", "GET", f"/xiaozhi/ota/d/{syn}/../../", None, 502, "neg_legacy_path_twodot"),
                 ]
                 for label, method, path, ref, exp_code, mode_tag in full_cases:
-                    fp = _free_port()
+                    fp = port_pool.reserve_listen(f"nginx_full_{label}")
                     ferr = tmp / f"full_{label}.log"
                     full_specs.append((label, fp, ferr, method, path, ref, exp_code, mode_tag))
                     use_dead = mode_tag in ("neg_legacy_raw_q", "neg_legacy_path_twodot")
@@ -4695,285 +4994,326 @@ def test_real_nginx_log_isolation(ota_base: str, dev_a: dict) -> set[str]:
                         rendered_srv = rendered_srv.replace("$passport_log_access", "$passport_legacy_no_path_log_access")
                     servers.append(rendered_srv)
 
-            conf = tmp / "nginx.conf"
-            conf.write_text(
-                f"worker_processes 1;\n"
-                f"daemon off;\n"
-                f"pid {tmp / 'nginx.pid'};\n"
-                f"error_log {global_err} warn;\n"
-                f"events {{ worker_connections 64; }}\n"
-                f"http {{\n"
-                f"    client_body_temp_path {tmp / 'client_body_temp'};\n"
-                f"    proxy_temp_path {tmp / 'proxy_temp'};\n"
-                f"    fastcgi_temp_path {tmp / 'fastcgi_temp'};\n"
-                f"    uwsgi_temp_path {tmp / 'uwsgi_temp'};\n"
-                f"    scgi_temp_path {tmp / 'scgi_temp'};\n"
-                f"{http_block}\n"
-                f"{legacy_http_extra}"
-                + "\n".join(servers)
-                + "\n}\n",
-                encoding="utf-8",
-            )
-
-            test_res = subprocess.run([str(nginx_bin), "-t", "-p", str(tmp), "-c", str(conf)], capture_output=True, text=True)
-            assert test_res.returncode == 0, f"nginx -t failed ({test_res.returncode}):\n{test_res.stderr}"
-
-            proc = subprocess.Popen(
-                [str(nginx_bin), "-p", str(tmp), "-c", str(conf)],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-            )
+            port_pool.assert_all_disjoint("real_nginx_pre_config")
+            listen_port_count = 3 + len(full_specs)
+            nginx_stderr = ""
             try:
-                deadline = time.monotonic() + 8.0
-                while time.monotonic() < deadline:
-                    if proc.poll() is not None:
-                        raise RuntimeError(f"Real nginx exited prematurely ({proc.returncode}): {proc.stderr.read()}")
-                    try:
-                        with socket.create_connection(("127.0.0.1", p_live), timeout=0.5):
-                            break
-                    except OSError:
-                        time.sleep(0.05)
+                conf = tmp / "nginx.conf"
+                conf.write_text(
+                    f"worker_processes 1;\n"
+                    f"daemon off;\n"
+                    f"pid {tmp / 'nginx.pid'};\n"
+                    f"error_log {global_err} warn;\n"
+                    f"events {{ worker_connections 64; }}\n"
+                    f"http {{\n"
+                    f"    client_body_temp_path {tmp / 'client_body_temp'};\n"
+                    f"    proxy_temp_path {tmp / 'proxy_temp'};\n"
+                    f"    fastcgi_temp_path {tmp / 'fastcgi_temp'};\n"
+                    f"    uwsgi_temp_path {tmp / 'uwsgi_temp'};\n"
+                    f"    scgi_temp_path {tmp / 'scgi_temp'};\n"
+                    f"{http_block}\n"
+                    f"{legacy_http_extra}"
+                    + "\n".join(servers)
+                    + "\n}\n",
+                    encoding="utf-8",
+                )
 
-                # Scenario 0 (counting upstream): verify zero upstream hits for all rejected literal,
-                # percent-encoded, smuggled, and non-allowlisted queries, unsafe Referers, and
-                # >=2 dot-segment / encoded OTA path traversals (+ single-dot 404 negative controls),
-                # plus exact upstream hits and header scrubbing for permitted requests.
-                for method, bad_path, bad_hdrs in (
-                    ("GET", f"/xiaozhi/ota/?token={q_syn}", {"Referer": "https://passport.example/"}),
-                    ("GET", f"/xiaozhi/ota/?%74oken={q_syn}", {"Referer": "https://passport.example/"}),
-                    ("GET", f"/xiaozhi/ota/?%54oken={q_syn}", {"Referer": "https://passport.example/"}),
-                    ("GET", f"/xiaozhi/ota/?%20token={q_syn}", {"Referer": "https://passport.example/"}),
-                    ("POST", f"/xiaozhi/ota/?%61pi_key={q_syn}", {"Content-Type": "application/json", "Referer": "https://passport.example/"}),
-                    ("GET", f"/xiaozhi/v1/?from=mqtt_gateway&%74oken={q_syn}", {"Referer": "https://passport.example/"}),
-                    ("GET", "/xiaozhi/v1/?%66rom=mqtt_gateway", {"Referer": "https://passport.example/"}),
-                    ("GET", "/xiaozhi/v1/?FROM=MQTT_GATEWAY", {"Referer": "https://passport.example/"}),
-                    ("POST", f"/mcp/vision/explain?%73ecret={q_syn}", {"Content-Type": "application/json", "Referer": "https://passport.example/"}),
-                    ("GET", f"/xiaozhi/ota/?|token={q_syn}", {"Referer": "https://passport.example/"}),
-                    ("GET", f"/xiaozhi/ota/?probe={benign_q}", {"Referer": "https://passport.example/"}),
-                    ("GET", "/xiaozhi/ota/?from=mqtt_gateway", {"Referer": "https://passport.example/"}),
-                    ("POST", f"/xiaozhi/ota/d/{syn}/?%74oken={q_syn}", {"Content-Type": "application/json"}),
-                    ("GET", "/xiaozhi/ota/", {"Referer": f"https://passport.example/%78iaozhi/%6fta/%64/{syn}/"}),
-                    ("GET", f"/xiaozhi/ota/d/{syn}/../../", {}),
-                    ("GET", f"/xiaozhi/ota/d/{syn}/../..", {}),
-                    ("GET", f"/xiaozhi/ota/d/{syn}/%2e%2e/%2e%2e/", {}),
-                    ("GET", f"/xiaozhi/ota/d/{syn}/%2e%2e/%2e%2e", {}),
-                    ("GET", f"/%78iaozhi/ota/d/{syn}/../../", {}),
-                    ("GET", f"/%78%69%61%6f%7a%68%69/%6f%74%61/%64/{syn}/../../", {}),
-                    ("GET", f"/xiaozhi/ota/d/{syn}/..%2f../", {}),
-                    ("GET", f"/%58iaozhi/%4fta/%44/{syn}/../../", {}),
-                    ("GET", f"/xiaozhi/ota/d/{syn}/../../../", {}),
-                    ("GET", f"/xiaozhi/ota/d/{syn}/../../../../xiaozhi/v1/", {}),
-                    ("POST", f"/xiaozhi/ota/d/{syn}/../../../../mcp/vision/explain", {"Content-Type": "application/json"}),
-                    ("GET", f"/xiaozhi/ota/d/{syn}/../../download/fw_1.0.bin", {}),
-                ):
-                    st_cnt_bad, _ = _raw_http(
-                        p_count,
-                        method,
-                        bad_path,
-                        headers=bad_hdrs,
-                        body=b"{}" if method == "POST" else None,
+                test_res = subprocess.run([str(nginx_bin), "-t", "-p", str(tmp), "-c", str(conf)], capture_output=True, text=True)
+                assert test_res.returncode == 0, f"nginx -t failed ({test_res.returncode}):\n{test_res.stderr}"
+
+                # Release listen placeholders right before starting Nginx; keep dead_port bound-unlistening throughout.
+                port_pool.release_listen_ports()
+                proc = subprocess.Popen(
+                    [str(nginx_bin), "-p", str(tmp), "-c", str(conf)],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                )
+                try:
+                    for wait_port in (p_count, p_live, p_dead):
+                        deadline = time.monotonic() + 8.0
+                        while time.monotonic() < deadline:
+                            if proc.poll() is not None:
+                                nginx_stderr = proc.stderr.read() if proc.stderr else ""
+                                raise RuntimeError(f"Real nginx exited prematurely ({proc.returncode}): {nginx_stderr}")
+                            try:
+                                with socket.create_connection(("127.0.0.1", wait_port), timeout=0.5):
+                                    break
+                            except OSError:
+                                time.sleep(0.05)
+                        else:
+                            raise TimeoutError(f"Real nginx port 127.0.0.1:{wait_port} did not become ready")
+
+                    port_pool.assert_dead_ports_unreachable("real_nginx_after_start")
+
+                    # Scenario 0 (counting upstream): verify zero upstream hits for all rejected literal,
+                    # percent-encoded, smuggled, and non-allowlisted queries, unsafe Referers, and
+                    # >=2 dot-segment / encoded OTA path traversals (+ single-dot 404 negative controls),
+                    # plus exact upstream hits and header scrubbing for permitted requests.
+                    for method, bad_path, bad_hdrs in (
+                        ("GET", f"/xiaozhi/ota/?token={q_syn}", {"Referer": "https://passport.example/"}),
+                        ("GET", f"/xiaozhi/ota/?%74oken={q_syn}", {"Referer": "https://passport.example/"}),
+                        ("GET", f"/xiaozhi/ota/?%54oken={q_syn}", {"Referer": "https://passport.example/"}),
+                        ("GET", f"/xiaozhi/ota/?%20token={q_syn}", {"Referer": "https://passport.example/"}),
+                        ("POST", f"/xiaozhi/ota/?%61pi_key={q_syn}", {"Content-Type": "application/json", "Referer": "https://passport.example/"}),
+                        ("GET", f"/xiaozhi/v1/?from=mqtt_gateway&%74oken={q_syn}", {"Referer": "https://passport.example/"}),
+                        ("GET", "/xiaozhi/v1/?%66rom=mqtt_gateway", {"Referer": "https://passport.example/"}),
+                        ("GET", "/xiaozhi/v1/?FROM=MQTT_GATEWAY", {"Referer": "https://passport.example/"}),
+                        ("POST", f"/mcp/vision/explain?%73ecret={q_syn}", {"Content-Type": "application/json", "Referer": "https://passport.example/"}),
+                        ("GET", f"/xiaozhi/ota/?|token={q_syn}", {"Referer": "https://passport.example/"}),
+                        ("GET", f"/xiaozhi/ota/?probe={benign_q}", {"Referer": "https://passport.example/"}),
+                        ("GET", "/xiaozhi/ota/?from=mqtt_gateway", {"Referer": "https://passport.example/"}),
+                        ("POST", f"/xiaozhi/ota/d/{syn}/?%74oken={q_syn}", {"Content-Type": "application/json"}),
+                        ("GET", "/xiaozhi/ota/", {"Referer": f"https://passport.example/%78iaozhi/%6fta/%64/{syn}/"}),
+                        ("GET", f"/xiaozhi/ota/d/{syn}/../../", {}),
+                        ("GET", f"/xiaozhi/ota/d/{syn}/../..", {}),
+                        ("GET", f"/xiaozhi/ota/d/{syn}/%2e%2e/%2e%2e/", {}),
+                        ("GET", f"/xiaozhi/ota/d/{syn}/%2e%2e/%2e%2e", {}),
+                        ("GET", f"/%78iaozhi/ota/d/{syn}/../../", {}),
+                        ("GET", f"/%78%69%61%6f%7a%68%69/%6f%74%61/%64/{syn}/../../", {}),
+                        ("GET", f"/xiaozhi/ota/d/{syn}/..%2f../", {}),
+                        ("GET", f"/%58iaozhi/%4fta/%44/{syn}/../../", {}),
+                        ("GET", f"/xiaozhi/ota/d/{syn}/../../../", {}),
+                        ("GET", f"/xiaozhi/ota/d/{syn}/../../../../xiaozhi/v1/", {}),
+                        ("POST", f"/xiaozhi/ota/d/{syn}/../../../../mcp/vision/explain", {"Content-Type": "application/json"}),
+                        ("GET", f"/xiaozhi/ota/d/{syn}/../../download/fw_1.0.bin", {}),
+                    ):
+                        st_cnt_bad, _ = _raw_http(
+                            p_count,
+                            method,
+                            bad_path,
+                            headers=bad_hdrs,
+                            body=b"{}" if method == "POST" else None,
+                            label="p_count",
+                        )
+                        assert st_cnt_bad == 400, f"Counting nginx failed to reject {method} {bad_path}: {st_cnt_bad}"
+                    for onedot_ctrl in (
+                        f"/xiaozhi/ota/d/{syn}/../",
+                        f"/xiaozhi/ota/d/{syn}/..",
+                        f"/xiaozhi/ota/d/{syn}/%2e%2e/",
+                        f"/%78iaozhi/ota/d/{syn}/../",
+                    ):
+                        st_cnt_404, _ = _raw_http(p_count, "GET", onedot_ctrl, label="p_count")
+                        assert st_cnt_404 == 404, f"Counting nginx single-dot negative control {onedot_ctrl} returned {st_cnt_404}"
+                    with cnt_lock:
+                        assert cnt_hits == [], f"Rejected/404 requests reached real nginx counting upstream: {cnt_hits}"
+
+                    st_cnt_ota, _ = _raw_http(
+                        p_count, "GET", "/xiaozhi/ota/", headers={"Referer": "https://passport.example/"}, label="p_count"
                     )
-                    assert st_cnt_bad == 400, f"Counting nginx failed to reject {method} {bad_path}: {st_cnt_bad}"
-                for onedot_ctrl in (
-                    f"/xiaozhi/ota/d/{syn}/../",
-                    f"/xiaozhi/ota/d/{syn}/..",
-                    f"/xiaozhi/ota/d/{syn}/%2e%2e/",
-                    f"/%78iaozhi/ota/d/{syn}/../",
-                ):
-                    st_cnt_404, _ = _raw_http(p_count, "GET", onedot_ctrl)
-                    assert st_cnt_404 == 404, f"Counting nginx single-dot negative control {onedot_ctrl} returned {st_cnt_404}"
-                with cnt_lock:
-                    assert cnt_hits == [], f"Rejected/404 requests reached real nginx counting upstream: {cnt_hits}"
-
-                st_cnt_ota, _ = _raw_http(
-                    p_count, "GET", "/xiaozhi/ota/", headers={"Referer": "https://passport.example/"}
-                )
-                assert st_cnt_ota == 200, st_cnt_ota
-                st_cnt_ws, _ = _raw_http(
-                    p_count, "GET", "/xiaozhi/v1/?from=mqtt_gateway", headers={"Referer": "https://passport.example/"}
-                )
-                assert st_cnt_ws == 200, st_cnt_ws
-                st_cnt_dl, _ = _raw_http(
-                    p_count, "GET", "/xiaozhi/ota/download/fw_1.0.bin", headers={"Referer": "https://passport.example/"}
-                )
-                assert st_cnt_dl == 200, st_cnt_dl
-                st_cnt_sec, _ = _raw_http(
-                    p_count,
-                    "POST",
-                    f"/xiaozhi/ota/d/{syn}/",
-                    headers={
-                        "Content-Type": "application/json",
-                        "X-Original-URI": f"/xiaozhi/ota/d/{syn}/",
-                        "Referer": "https://passport.example/",
-                        "Authorization": f"Bearer {q_syn}",
-                    },
-                    body=b"{}",
-                )
-                assert st_cnt_sec == 200, st_cnt_sec
-                with cnt_lock:
-                    assert len(cnt_hits) == 4, f"Expected 4 forwarded hits on counting upstream, got {len(cnt_hits)}"
-                    assert cnt_hits[0]["path"] == "/xiaozhi/ota/"
-                    assert cnt_hits[1]["path"] == "/xiaozhi/v1/?from=mqtt_gateway"
-                    assert cnt_hits[2]["path"] == "/xiaozhi/ota/download/fw_1.0.bin"
-                    assert cnt_hits[3]["path"] == "/xiaozhi/ota/"
-                    assert cnt_hits[3]["headers"].get("x-ota-secret") == syn
-                    for scrubbed in ("authorization", "x-original-uri", "referer"):
-                        assert scrubbed not in cnt_hits[3]["headers"], f"Counting upstream still saw {scrubbed}"
-                    cnt_hits.clear()
-
-                # Scenario 1: Normal rejection & live OTA forwarding.
-                for ota_path in (f"/xiaozhi/ota/d/{dev_a['ota_secret']}/", f"/%78iaozhi/%6fta/%64/{dev_a['ota_secret']}/"):
-                    st, raw = _raw_http(
-                        p_live,
+                    assert st_cnt_ota == 200, st_cnt_ota
+                    st_cnt_ws, _ = _raw_http(
+                        p_count, "GET", "/xiaozhi/v1/?from=mqtt_gateway", headers={"Referer": "https://passport.example/"}, label="p_count"
+                    )
+                    assert st_cnt_ws == 200, st_cnt_ws
+                    st_cnt_dl, _ = _raw_http(
+                        p_count, "GET", "/xiaozhi/ota/download/fw_1.0.bin", headers={"Referer": "https://passport.example/"}, label="p_count"
+                    )
+                    assert st_cnt_dl == 200, st_cnt_dl
+                    st_cnt_sec, _ = _raw_http(
+                        p_count,
                         "POST",
-                        ota_path,
+                        f"/xiaozhi/ota/d/{syn}/",
                         headers={
                             "Content-Type": "application/json",
-                            "Device-Id": dev_a["device_id"],
-                            "Client-Id": dev_a["client_id"],
-                            "X-Original-URI": ota_path,
-                            "Referer": "https://proxy.example/",
+                            "X-Original-URI": f"/xiaozhi/ota/d/{syn}/",
+                            "Referer": "https://passport.example/",
+                            "Authorization": f"Bearer {q_syn}",
                         },
                         body=b"{}",
+                        label="p_count",
                     )
-                    assert st == 200, f"Real nginx live OTA forward failed ({st}): {raw!r}"
-                    tok = json.loads(raw.decode("utf-8"))["websocket"]["token"]
-                    assert tok
-                    issued_tokens.add(tok)
+                    assert st_cnt_sec == 200, st_cnt_sec
+                    with cnt_lock:
+                        assert len(cnt_hits) == 4, f"Expected 4 forwarded hits on counting upstream, got {len(cnt_hits)}"
+                        assert cnt_hits[0]["path"] == "/xiaozhi/ota/"
+                        assert cnt_hits[1]["path"] == "/xiaozhi/v1/?from=mqtt_gateway"
+                        assert cnt_hits[2]["path"] == "/xiaozhi/ota/download/fw_1.0.bin"
+                        assert cnt_hits[3]["path"] == "/xiaozhi/ota/"
+                        assert cnt_hits[3]["headers"].get("x-ota-secret") == syn
+                        for scrubbed in ("authorization", "x-original-uri", "referer"):
+                            assert scrubbed not in cnt_hits[3]["headers"], f"Counting upstream still saw {scrubbed}"
+                        cnt_hits.clear()
 
-                st_get, _ = _raw_http(p_live, "GET", "/xiaozhi/ota/")
-                assert st_get == 200, st_get
-                st_ws_mqtt, _ = _raw_http(p_live, "GET", "/xiaozhi/v1/?from=mqtt_gateway")
-                assert st_ws_mqtt == 200, st_ws_mqtt
-                st_get_probe, _ = _raw_http(p_live, "GET", f"/xiaozhi/ota/?probe={benign_q}")
-                assert st_get_probe == 400, st_get_probe
-                for q_headers in (
-                    {"Content-Type": "application/json"},
-                    {"Content-Type": "application/json", "Referer": "https://passport.example/"},
-                ):
-                    for q_path in (f"/xiaozhi/ota/?token={q_syn}", f"/xiaozhi/ota/?%74oken={q_syn}"):
-                        st_q, _ = _raw_http(
+                    # Scenario 1: Normal rejection & live OTA forwarding.
+                    for ota_path in (f"/xiaozhi/ota/d/{dev_a['ota_secret']}/", f"/%78iaozhi/%6fta/%64/{dev_a['ota_secret']}/"):
+                        st, raw = _raw_http(
                             p_live,
                             "POST",
-                            q_path,
-                            headers=q_headers,
+                            ota_path,
+                            headers={
+                                "Content-Type": "application/json",
+                                "Device-Id": dev_a["device_id"],
+                                "Client-Id": dev_a["client_id"],
+                                "X-Original-URI": ota_path,
+                                "Referer": "https://proxy.example/",
+                            },
                             body=b"{}",
+                            label="p_live",
                         )
-                        assert st_q == 400, (q_path, st_q)
-                st_ws_q, _ = _raw_http(
-                    p_live,
-                    "GET",
-                    f"/xiaozhi/v1/?foo=1&API_KEY={q_syn}",
-                    headers={"Referer": "https://passport.example/"},
-                )
-                assert st_ws_q == 400, st_ws_q
-                st_vis_q, _ = _raw_http(
-                    p_live,
-                    "POST",
-                    f"/mcp/vision/explain?secret={q_syn}",
-                    headers={"Content-Type": "application/json", "Referer": "https://passport.example/"},
-                    body=b"{}",
-                )
-                assert st_vis_q == 400, st_vis_q
+                        assert st == 200, f"Real nginx live OTA forward failed ({st}): {raw!r}"
+                        tok = json.loads(raw.decode("utf-8"))["websocket"]["token"]
+                        assert tok
+                        issued_tokens.add(tok)
+                        forbidden_all.add(tok)
 
-                unsafe_referers = [
-                    f"https://passport.example/xiaozhi/ota/d/{syn}/",
-                    f"https://passport.example/xiaozhi%2Fota%2Fd%2F{syn}%2F",
-                    f"https://passport.example/%78iaozhi/%6fta/%64/{syn}/",
-                    f"https://passport.example/%78%69%61%6f%7a%68%69/%6f%74%61/%64/{syn}/",
-                    f"https://passport.example/xia%6fzhi/o%74a/%64/{syn}/",
-                    f"https://passport.example/xia%4fzhi/O%54a/%44/{syn}/",
-                    f"https://passport.example/xiaozhi/./foo/../ota//d/{syn}/",
-                    f"https://u:{syn}@passport.example/",
-                    f"https://passport.example/?token={q_syn}",
-                    "https://passport.example/docs",
-                ]
-                for bad_ref in unsafe_referers:
-                    for req_path in ("/xiaozhi/ota/", f"/xiaozhi/ota/d/{dev_a['ota_secret']}/", f"/%78iaozhi/%6fta/%64/{syn}/"):
-                        st_ref, _ = _raw_http(
-                            p_live,
+                    st_get, _ = _raw_http(p_live, "GET", "/xiaozhi/ota/", label="p_live")
+                    assert st_get == 200, st_get
+                    st_ws_mqtt, _ = _raw_http(p_live, "GET", "/xiaozhi/v1/?from=mqtt_gateway", label="p_live")
+                    assert st_ws_mqtt == 200, st_ws_mqtt
+                    st_get_probe, _ = _raw_http(p_live, "GET", f"/xiaozhi/ota/?probe={benign_q}", label="p_live")
+                    assert st_get_probe == 400, st_get_probe
+                    for q_headers in (
+                        {"Content-Type": "application/json"},
+                        {"Content-Type": "application/json", "Referer": "https://passport.example/"},
+                    ):
+                        for q_path in (f"/xiaozhi/ota/?token={q_syn}", f"/xiaozhi/ota/?%74oken={q_syn}"):
+                            st_q, _ = _raw_http(
+                                p_live,
+                                "POST",
+                                q_path,
+                                headers=q_headers,
+                                body=b"{}",
+                                label="p_live",
+                            )
+                            assert st_q == 400, (q_path, st_q)
+                    st_ws_q, _ = _raw_http(
+                        p_live,
+                        "GET",
+                        f"/xiaozhi/v1/?foo=1&API_KEY={q_syn}",
+                        headers={"Referer": "https://passport.example/"},
+                        label="p_live",
+                    )
+                    assert st_ws_q == 400, st_ws_q
+                    st_vis_q, _ = _raw_http(
+                        p_live,
+                        "POST",
+                        f"/mcp/vision/explain?secret={q_syn}",
+                        headers={"Content-Type": "application/json", "Referer": "https://passport.example/"},
+                        body=b"{}",
+                        label="p_live",
+                    )
+                    assert st_vis_q == 400, st_vis_q
+
+                    unsafe_referers = [
+                        f"https://passport.example/xiaozhi/ota/d/{syn}/",
+                        f"https://passport.example/xiaozhi%2Fota%2Fd%2F{syn}%2F",
+                        f"https://passport.example/%78iaozhi/%6fta/%64/{syn}/",
+                        f"https://passport.example/%78%69%61%6f%7a%68%69/%6f%74%61/%64/{syn}/",
+                        f"https://passport.example/xia%6fzhi/o%74a/%64/{syn}/",
+                        f"https://passport.example/xia%4fzhi/O%54a/%44/{syn}/",
+                        f"https://passport.example/xiaozhi/./foo/../ota//d/{syn}/",
+                        f"https://u:{syn}@passport.example/",
+                        f"https://passport.example/?token={q_syn}",
+                        "https://passport.example/docs",
+                    ]
+                    for bad_ref in unsafe_referers:
+                        for req_path in ("/xiaozhi/ota/", f"/xiaozhi/ota/d/{dev_a['ota_secret']}/", f"/%78iaozhi/%6fta/%64/{syn}/"):
+                            st_ref, _ = _raw_http(
+                                p_live,
+                                "POST",
+                                req_path,
+                                headers={"Content-Type": "application/json", "Referer": bad_ref},
+                                body=b"{}",
+                                label="p_live",
+                            )
+                            assert st_ref == 400, f"Real nginx failed to reject Referer on {req_path}: {st_ref}"
+                    st_ws_ref, _ = _raw_http(p_live, "GET", "/xiaozhi/v1/", headers={"Referer": unsafe_referers[3]}, label="p_live")
+                    assert st_ws_ref == 400, st_ws_ref
+
+                    # Scenario 2: Dead upstream (502), unsafe Referer rejections, and literal/encoded query rejections.
+                    for bad_ref in unsafe_referers:
+                        st_d_ref, _ = _raw_http(
+                            p_dead,
                             "POST",
-                            req_path,
+                            "/xiaozhi/ota/",
                             headers={"Content-Type": "application/json", "Referer": bad_ref},
                             body=b"{}",
+                            label="p_dead",
                         )
-                        assert st_ref == 400, f"Real nginx failed to reject Referer on {req_path}: {st_ref}"
-                st_ws_ref, _ = _raw_http(p_live, "GET", "/xiaozhi/v1/", headers={"Referer": unsafe_referers[3]})
-                assert st_ws_ref == 400, st_ws_ref
-
-                # Scenario 2: Dead upstream (502), unsafe Referer rejections, and literal/encoded query rejections.
-                for bad_ref in unsafe_referers:
-                    st_d_ref, _ = _raw_http(
+                        assert st_d_ref == 400, st_d_ref
+                    for bad_dead_method, bad_dead_path in (
+                        ("POST", f"/xiaozhi/ota/?token={q_syn}"),
+                        ("GET", f"/xiaozhi/ota/?%74oken={q_syn}"),
+                        ("GET", f"/xiaozhi/ota/?%54oken={q_syn}"),
+                        ("GET", f"/xiaozhi/v1/?from=mqtt_gateway&%74oken={q_syn}"),
+                        ("GET", "/xiaozhi/v1/?FROM=MQTT_GATEWAY"),
+                        ("POST", f"/xiaozhi/ota/d/{syn}/?%74oken={q_syn}"),
+                        ("GET", f"/xiaozhi/ota/d/{syn}/../../"),
+                        ("GET", f"/xiaozhi/ota/d/{syn}/../.."),
+                        ("GET", f"/xiaozhi/ota/d/{syn}/%2e%2e/%2e%2e/"),
+                        ("GET", f"/xiaozhi/ota/d/{syn}/%2e%2e/%2e%2e"),
+                        ("GET", f"/%78iaozhi/ota/d/{syn}/../../"),
+                        ("GET", f"/%78%69%61%6f%7a%68%69/%6f%74%61/%64/{syn}/../../"),
+                        ("GET", f"/xiaozhi/ota/d/{syn}/../../../"),
+                        ("GET", f"/xiaozhi/ota/d/{syn}/../../../../xiaozhi/v1/"),
+                    ):
+                        st_d_q, _ = _raw_http(
+                            p_dead,
+                            bad_dead_method,
+                            bad_dead_path,
+                            headers={"Content-Type": "application/json", "Referer": "https://passport.example/"},
+                            body=b"{}" if bad_dead_method == "POST" else None,
+                            label="p_dead",
+                        )
+                        assert st_d_q == 400, (bad_dead_method, bad_dead_path, st_d_q)
+                    for onedot_dead in (f"/xiaozhi/ota/d/{syn}/../", f"/xiaozhi/ota/d/{syn}/.."):
+                        st_d_404, _ = _raw_http(p_dead, "GET", onedot_dead, label="p_dead")
+                        assert st_d_404 == 404, (onedot_dead, st_d_404)
+                    st_502_safe, _ = _raw_http(
                         p_dead,
                         "POST",
                         "/xiaozhi/ota/",
-                        headers={"Content-Type": "application/json", "Referer": bad_ref},
-                        body=b"{}",
-                    )
-                    assert st_d_ref == 400, st_d_ref
-                for bad_dead_method, bad_dead_path in (
-                    ("POST", f"/xiaozhi/ota/?token={q_syn}"),
-                    ("GET", f"/xiaozhi/ota/?%74oken={q_syn}"),
-                    ("GET", f"/xiaozhi/ota/?%54oken={q_syn}"),
-                    ("GET", f"/xiaozhi/v1/?from=mqtt_gateway&%74oken={q_syn}"),
-                    ("GET", "/xiaozhi/v1/?FROM=MQTT_GATEWAY"),
-                    ("POST", f"/xiaozhi/ota/d/{syn}/?%74oken={q_syn}"),
-                    ("GET", f"/xiaozhi/ota/d/{syn}/../../"),
-                    ("GET", f"/xiaozhi/ota/d/{syn}/../.."),
-                    ("GET", f"/xiaozhi/ota/d/{syn}/%2e%2e/%2e%2e/"),
-                    ("GET", f"/xiaozhi/ota/d/{syn}/%2e%2e/%2e%2e"),
-                    ("GET", f"/%78iaozhi/ota/d/{syn}/../../"),
-                    ("GET", f"/%78%69%61%6f%7a%68%69/%6f%74%61/%64/{syn}/../../"),
-                    ("GET", f"/xiaozhi/ota/d/{syn}/../../../"),
-                    ("GET", f"/xiaozhi/ota/d/{syn}/../../../../xiaozhi/v1/"),
-                ):
-                    st_d_q, _ = _raw_http(
-                        p_dead,
-                        bad_dead_method,
-                        bad_dead_path,
                         headers={"Content-Type": "application/json", "Referer": "https://passport.example/"},
-                        body=b"{}" if bad_dead_method == "POST" else None,
+                        body=b"{}",
+                        label="p_dead_502_safe",
                     )
-                    assert st_d_q == 400, (bad_dead_method, bad_dead_path, st_d_q)
-                for onedot_dead in (f"/xiaozhi/ota/d/{syn}/../", f"/xiaozhi/ota/d/{syn}/.."):
-                    st_d_404, _ = _raw_http(p_dead, "GET", onedot_dead)
-                    assert st_d_404 == 404, (onedot_dead, st_d_404)
-                st_502_safe, _ = _raw_http(
-                    p_dead,
-                    "POST",
-                    "/xiaozhi/ota/",
-                    headers={"Content-Type": "application/json", "Referer": "https://passport.example/"},
-                    body=b"{}",
-                )
-                assert st_502_safe == 502, st_502_safe
-                for sec_path in (f"/xiaozhi/ota/d/{syn}/", f"/%78iaozhi/%6fta/%64/{syn}/"):
-                    st_502_sec, _ = _raw_http(p_dead, "POST", sec_path, headers={"Content-Type": "application/json"}, body=b"{}")
-                    assert st_502_sec == 502, st_502_sec
+                    assert st_502_safe == 502, st_502_safe
+                    for sec_path in (f"/xiaozhi/ota/d/{syn}/", f"/%78iaozhi/%6fta/%64/{syn}/"):
+                        st_502_sec, _ = _raw_http(
+                            p_dead,
+                            "POST",
+                            sec_path,
+                            headers={"Content-Type": "application/json"},
+                            body=b"{}",
+                            label="p_dead_502_secret",
+                        )
+                        assert st_502_sec == 502, st_502_sec
+                    port_pool.assert_dead_ports_unreachable("real_nginx_after_502")
 
-                # Scenario 3: Access log write failure (/dev/full) + positive triggers + negative controls.
-                for label, fp, _ferr, method, path, ref, exp_code, _mtag in full_specs:
-                    hdrs = {"Content-Type": "application/json"} if method == "POST" else {}
-                    if ref is not None:
-                        hdrs["Referer"] = ref
-                    st_f, _ = _raw_http(fp, method, path, headers=hdrs, body=b"{}" if method == "POST" else None)
-                    assert st_f == exp_code, f"/dev/full case {label} returned {st_f}, expected {exp_code}"
+                    # Scenario 3: Access log write failure (/dev/full) + positive triggers + negative controls.
+                    for label, fp, _ferr, method, path, ref, exp_code, _mtag in full_specs:
+                        hdrs = {"Content-Type": "application/json"} if method == "POST" else {}
+                        if ref is not None:
+                            hdrs["Referer"] = ref
+                        st_f, _ = _raw_http(
+                            fp,
+                            method,
+                            path,
+                            headers=hdrs,
+                            body=b"{}" if method == "POST" else None,
+                            label=f"full_{label}",
+                        )
+                        assert st_f == exp_code, f"/dev/full case {label} returned {st_f}, expected {exp_code}"
 
-                _wait_for_log_substring([cnt_acc], "/xiaozhi/ota/download/fw_1.0.bin")
-                _wait_for_log_substring([dead_err], "connect() failed")
-                _wait_for_log_substring([live_acc], "/xiaozhi/v1/?[REDACTED]")
-                if full_specs:
-                    _wait_for_log_substring([tmp / "full_fixed_safe_pos.log"], "[alert]")
-                    _wait_for_log_substring([tmp / "full_fixed_ws_mqtt_pos.log"], "[alert]")
-                    _wait_for_log_substring([tmp / "full_neg_uncond_lit.log"], "[alert]")
-                    _wait_for_log_substring([tmp / "full_neg_uncond_enc.log"], "[alert]")
-                    _wait_for_log_substring([tmp / "full_neg_uncond_ota_q.log"], "[alert]")
-                    _wait_for_log_substring([tmp / "full_neg_uncond_enc_q.log"], "[alert]")
-                    _wait_for_log_substring([tmp / "full_neg_legacy_raw_q.log"], "[alert]")
-                    _wait_for_log_substring([tmp / "full_neg_legacy_raw_q.log"], "connect() failed")
-                    _wait_for_log_substring([tmp / "full_neg_legacy_path_twodot.log"], "[alert]")
-                    _wait_for_log_substring([tmp / "full_neg_legacy_path_twodot.log"], "connect() failed")
-                time.sleep(0.15)
+                    _wait_for_log_substring([cnt_acc], "/xiaozhi/ota/download/fw_1.0.bin")
+                    _wait_for_log_substring([dead_err], "connect() failed")
+                    _wait_for_log_substring([live_acc], "/xiaozhi/v1/?[REDACTED]")
+                    if full_specs:
+                        _wait_for_log_substring([tmp / "full_fixed_safe_pos.log"], "[alert]")
+                        _wait_for_log_substring([tmp / "full_fixed_ws_mqtt_pos.log"], "[alert]")
+                        _wait_for_log_substring([tmp / "full_neg_uncond_lit.log"], "[alert]")
+                        _wait_for_log_substring([tmp / "full_neg_uncond_enc.log"], "[alert]")
+                        _wait_for_log_substring([tmp / "full_neg_uncond_ota_q.log"], "[alert]")
+                        _wait_for_log_substring([tmp / "full_neg_uncond_enc_q.log"], "[alert]")
+                        _wait_for_log_substring([tmp / "full_neg_legacy_raw_q.log"], "[alert]")
+                        _wait_for_log_substring([tmp / "full_neg_legacy_raw_q.log"], "connect() failed")
+                        _wait_for_log_substring([tmp / "full_neg_legacy_path_twodot.log"], "[alert]")
+                        _wait_for_log_substring([tmp / "full_neg_legacy_path_twodot.log"], "connect() failed")
+                    time.sleep(0.15)
+                finally:
+                    proc.terminate()
+                    _, nginx_stderr = proc.communicate(timeout=5)
 
                 cnt_acc_lines = [ln for ln in cnt_acc.read_text(encoding="utf-8", errors="replace").splitlines() if ln.strip()]
                 cnt_err_txt = cnt_err.read_text(encoding="utf-8", errors="replace")
@@ -4999,6 +5339,9 @@ def test_real_nginx_log_isolation(ota_base: str, dev_a: dict) -> set[str]:
                 dead_err_lines = [ln for ln in dead_err_txt.splitlines() if ln.strip()]
                 assert len(dead_err_lines) == 1 and 'referrer: "https://passport.example/"' in dead_err_lines[0], (
                     f"Unexpected dead_error.log: {redact_text(dead_err_txt)}"
+                )
+                assert f"127.0.0.1:{dead_port}" in dead_err_lines[0] and "Connection refused" in dead_err_lines[0], (
+                    f"dead_error.log did not target held dead_port={dead_port}: {redact_text(dead_err_txt)}"
                 )
 
                 all_fixed_logs = [
@@ -5037,20 +5380,40 @@ def test_real_nginx_log_isolation(ota_base: str, dev_a: dict) -> set[str]:
                             f"Real nginx legacy-path two-dot negative control failed to leak in both connect() and [alert]: {ftxt!r}"
                         )
 
-                forbidden_all = {syn, q_syn, benign_q, dev_a["ota_secret"], *issued_tokens}
                 joined_fixed = "\n".join(all_fixed_logs)
                 for secret_val in forbidden_all:
                     assert secret_val not in joined_fixed, "Real nginx log leaked secret!"
                 assert "/xiaozhi/ota/d/" not in joined_fixed, "Real nginx log recorded /xiaozhi/ota/d/!"
-            finally:
-                proc.terminate()
-                proc.wait(timeout=5)
+                port_pool.assert_dead_ports_unreachable("real_nginx_end")
+            except BaseException as exc:
+                diag_files = {
+                    "global_error": global_err,
+                    "cnt_error": cnt_err,
+                    "live_error": live_err,
+                    "dead_error": dead_err,
+                }
+                for label, _fp, ferr, _m, _p, _r, _ec, _mt in full_specs:
+                    if ferr.is_file() and ferr.stat().st_size > 0:
+                        diag_files[f"full_{label}"] = ferr
+                diag_path = _save_proxy_failure_diag(
+                    "real-nginx",
+                    port_map=port_pool.port_map(),
+                    dead_hold_state=port_pool.dead_hold_state(),
+                    last_response=last_response or None,
+                    log_files=diag_files,
+                    extra_logs={"nginx_stderr": nginx_stderr} if nginx_stderr else None,
+                    forbidden_secrets=forbidden_all,
+                    error=exc,
+                )
+                print(f"[DIAG] saved redacted real-nginx failure diagnostics to {diag_path}", file=sys.stderr)
+                raise
     finally:
         cnt_srv.shutdown()
         cnt_srv.server_close()
 
     print(
-        f"[PASS] real {nginx_ver} (loopback 127.0.0.1, nginx -t rc=0): counting upstream zero-hit/forward, "
+        f"[PASS] real {nginx_ver} (loopback 127.0.0.1, {listen_port_count} distinct listen ports, "
+        f"held dead_port={dead_port}, nginx -t rc=0): counting upstream zero-hit/forward, "
         f"502 upstream failure, and /dev/full={has_dev_full} access_log failure (Referer + literal/encoded query) "
         f"+ negative controls passed with zero secret leaks"
     )
@@ -5098,306 +5461,391 @@ def test_real_caddy_adapt_and_routing(ota_base: str, dev_a: dict) -> set[str]:
 
     cnt_http_srv, cnt_http_port, cnt_http_hits, cnt_http_lock = _start_counting_upstream()
     cnt_ws_srv, cnt_ws_port, cnt_ws_hits, cnt_ws_lock = _start_counting_upstream()
-    dead_port = _free_port()
-    live_port = _free_port()
-    dead_proxy_port = _free_port()
     syn = "realcaddy_ota_" + secrets.token_hex(12)
     q_syn = "realcaddy_q_" + secrets.token_hex(10)
     bearer_syn = "realcaddy_bearer_" + secrets.token_hex(10)
     benign_q = "realcaddy_benign_" + secrets.token_hex(8)
+    forbidden_all = {syn, q_syn, bearer_syn, benign_q, dev_a["ota_secret"]}
+    live_http_port = urlsplit(ota_base).port
+    last_response: dict = {}
 
     try:
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with tempfile.TemporaryDirectory() as tmpdir, _ReservedPortPool() as port_pool:
             tmp = Path(tmpdir)
+            if live_http_port is not None:
+                port_pool.register_external("live_ota_http", live_http_port)
+            port_pool.register_external("counting_http", cnt_http_port)
+            port_pool.register_external("counting_ws", cnt_ws_port)
+            dead_port = port_pool.reserve_dead("dead_upstream")
+            live_port = port_pool.reserve_listen("caddy_live")
+            dead_proxy_port = port_pool.reserve_listen("caddy_dead")
+            port_pool.assert_all_disjoint("real_caddy_pre_adapt")
+
             live_acc_log = tmp / "caddy_live_access.log"
             dead_acc_log = tmp / "caddy_dead_access.log"
             err_log = tmp / "caddy_error.log"
-            cf_path, caddy_env, iso_dirs = _prepare_real_caddy_fixture(
-                caddy_text,
-                tmp,
-                live_port=live_port,
-                counting_http_port=cnt_http_port,
-                counting_ws_port=cnt_ws_port,
-                dead_proxy_port=dead_proxy_port,
-                dead_port=dead_port,
-                live_acc_log=live_acc_log,
-                dead_acc_log=dead_acc_log,
-                err_log=err_log,
-            )
-
-            adapt_res = subprocess.run(
-                [str(caddy_bin), "adapt", "--config", str(cf_path), "--adapter", "caddyfile"],
-                env=caddy_env,
-                capture_output=True,
-                text=True,
-            )
-            assert adapt_res.returncode == 0, f"caddy adapt failed ({adapt_res.returncode}):\n{adapt_res.stderr}"
-            adapted_json = json.loads(adapt_res.stdout)
-            admin_cfg = adapted_json.get("admin") or {}
-            assert admin_cfg.get("disabled") is True, f"Expected admin disabled in adapted JSON: {admin_cfg}"
-            assert (admin_cfg.get("config") or {}).get("persist") is False, (
-                f"Expected admin.config.persist=false in adapted JSON: {admin_cfg}"
-            )
-            servers_json = (adapted_json.get("apps") or {}).get("http", {}).get("servers") or {}
-            assert servers_json and all(srv.get("routes") for srv in servers_json.values()), (
-                f"Unexpected adapted Caddy servers/routes: {adapted_json}"
-            )
-
-            proc = subprocess.Popen(
-                [str(caddy_bin), "run", "--config", str(cf_path), "--adapter", "caddyfile"],
-                env=caddy_env,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-            )
             caddy_stderr = ""
             try:
-                for wait_port in (live_port, dead_proxy_port):
-                    deadline = time.monotonic() + 8.0
-                    while time.monotonic() < deadline:
-                        if proc.poll() is not None:
-                            raise RuntimeError(
-                                f"Real caddy exited prematurely ({proc.returncode}): {proc.stderr.read()}"
-                            )
+                cf_path, caddy_env, iso_dirs = _prepare_real_caddy_fixture(
+                    caddy_text,
+                    tmp,
+                    live_port=live_port,
+                    counting_http_port=cnt_http_port,
+                    counting_ws_port=cnt_ws_port,
+                    dead_proxy_port=dead_proxy_port,
+                    dead_port=dead_port,
+                    live_acc_log=live_acc_log,
+                    dead_acc_log=dead_acc_log,
+                    err_log=err_log,
+                )
+
+                adapt_res = subprocess.run(
+                    [str(caddy_bin), "adapt", "--config", str(cf_path), "--adapter", "caddyfile"],
+                    env=caddy_env,
+                    capture_output=True,
+                    text=True,
+                )
+                assert adapt_res.returncode == 0, f"caddy adapt failed ({adapt_res.returncode}):\n{adapt_res.stderr}"
+                adapted_json = json.loads(adapt_res.stdout)
+                admin_cfg = adapted_json.get("admin") or {}
+                assert admin_cfg.get("disabled") is True, f"Expected admin disabled in adapted JSON: {admin_cfg}"
+                assert (admin_cfg.get("config") or {}).get("persist") is False, (
+                    f"Expected admin.config.persist=false in adapted JSON: {admin_cfg}"
+                )
+                servers_json = (adapted_json.get("apps") or {}).get("http", {}).get("servers") or {}
+                assert servers_json and all(srv.get("routes") for srv in servers_json.values()), (
+                    f"Unexpected adapted Caddy servers/routes: {adapted_json}"
+                )
+
+                # Release listen placeholders right before starting Caddy; keep dead_port bound-unlistening throughout.
+                port_pool.release_listen_ports()
+                proc = subprocess.Popen(
+                    [str(caddy_bin), "run", "--config", str(cf_path), "--adapter", "caddyfile"],
+                    env=caddy_env,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                )
+                try:
+                    for wait_port in (live_port, dead_proxy_port):
+                        deadline = time.monotonic() + 8.0
+                        while time.monotonic() < deadline:
+                            if proc.poll() is not None:
+                                caddy_stderr = proc.stderr.read() if proc.stderr else ""
+                                raise RuntimeError(
+                                    f"Real caddy exited prematurely ({proc.returncode}): {caddy_stderr}"
+                                )
+                            try:
+                                with socket.create_connection(("127.0.0.1", wait_port), timeout=0.5):
+                                    break
+                            except OSError:
+                                time.sleep(0.05)
+                        else:
+                            raise TimeoutError(f"Real caddy port 127.0.0.1:{wait_port} did not become ready")
+
+                    port_pool.assert_dead_ports_unreachable("real_caddy_after_start")
+
+                    live_base = f"http://127.0.0.1:{live_port}"
+                    dead_base = f"http://127.0.0.1:{dead_proxy_port}"
+
+                    def _record_last(label: str, port: int, method: str, path: str, status: int, preview: str) -> None:
+                        last_response.clear()
+                        last_response.update(
+                            {
+                                "label": label,
+                                "port": port,
+                                "method": method,
+                                "path": path,
+                                "status": status,
+                                "body_preview": preview[:512],
+                            }
+                        )
+
+                    def _caddy_raw_http(
+                        port: int,
+                        method: str,
+                        path: str,
+                        *,
+                        headers: Optional[dict[str, str]] = None,
+                        body: Optional[bytes] = None,
+                        label: str = "",
+                    ) -> int:
+                        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
                         try:
-                            with socket.create_connection(("127.0.0.1", wait_port), timeout=0.5):
-                                break
-                        except OSError:
-                            time.sleep(0.05)
-
-                live_base = f"http://127.0.0.1:{live_port}"
-                dead_base = f"http://127.0.0.1:{dead_proxy_port}"
-
-                def _caddy_raw_http(port: int, method: str, path: str, *, headers: Optional[dict[str, str]] = None, body: Optional[bytes] = None) -> int:
-                    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
-                    try:
-                        hdrs = {"Connection": "close", **(headers or {})}
-                        conn.request(method, path, body=body, headers=hdrs)
-                        resp = conn.getresponse()
-                        resp.read()
-                        return resp.status
-                    finally:
-                        conn.close()
-
-                # 1. All literal, uppercase, percent-encoded credential queries, unexpected queries,
-                #    and non-canonical OTA traversal paths must be rejected at the proxy (400 / 404)
-                #    with ZERO hits on both counting upstreams.
-                for qk in sorted(SENSITIVE_QUERY_KEYS):
-                    enc_l = f"%{ord(qk[0].lower()):02x}{qk[1:]}"
-                    enc_u = f"%{ord(qk[0].upper()):02X}{qk[1:]}"
-                    for q_pair in (
-                        f"{qk}={q_syn}",
-                        f"{qk.upper()}={q_syn}",
-                        f"{enc_l}={q_syn}",
-                        f"{enc_u}={q_syn}",
-                        f"from=mqtt_gateway&{enc_l}={q_syn}",
-                    ):
-                        for route_path in (
-                            "/xiaozhi/ota/",
-                            f"/xiaozhi/ota/d/{syn}/",
-                            "/mcp/vision/explain",
-                            "/xiaozhi/v1/",
-                        ):
-                            st_cq, _ = post_json(
-                                f"{live_base}{route_path}?{q_pair}",
-                                {"Device-Id": dev_a["device_id"], "Client-Id": dev_a["client_id"]},
+                            hdrs = {"Connection": "close", **(headers or {})}
+                            conn.request(method, path, body=body, headers=hdrs)
+                            resp = conn.getresponse()
+                            data = resp.read()
+                            _record_last(
+                                label or str(port),
+                                port,
+                                method,
+                                path,
+                                resp.status,
+                                data.decode("utf-8", "replace"),
                             )
-                            assert st_cq == 400, f"Real caddy failed to reject {route_path}?{q_pair}: {st_cq}"
-                for bad_get in (
-                    f"/xiaozhi/ota/?%74oken={q_syn}",
-                    f"/xiaozhi/ota/?%54oken={q_syn}",
-                    f"/xiaozhi/ota/?probe={benign_q}",
-                    "/xiaozhi/ota/?from=mqtt_gateway",
-                    "/xiaozhi/v1/?%66rom=mqtt_gateway",
-                    "/xiaozhi/v1/?FROM=MQTT_GATEWAY",
-                ):
-                    try:
-                        with urllib.request.urlopen(f"{live_base}{bad_get}", timeout=5):
-                            raise AssertionError(f"Expected 400 on real caddy GET {bad_get}")
-                    except urllib.error.HTTPError as exc:
-                        assert exc.code == 400, f"Real caddy returned {exc.code} for GET {bad_get}"
-                for raw_method, raw_trav in (
-                    ("GET", f"/xiaozhi/ota/d/{syn}/.."),
-                    ("GET", f"/xiaozhi/ota/d/{syn}/../../"),
-                    ("GET", f"/xiaozhi/ota/d/{syn}/../.."),
-                    ("GET", f"/xiaozhi/ota/d/{syn}/%2e%2e/%2e%2e/"),
-                    ("GET", f"/xiaozhi/ota/d/{syn}/%2e%2e/%2e%2e"),
-                    ("GET", f"/%78iaozhi/ota/d/{syn}/../../"),
-                    ("GET", f"/%78%69%61%6f%7a%68%69/%6f%74%61/%64/{syn}/../../"),
-                    ("GET", f"/xiaozhi/ota/d/{syn}/..%2f../"),
-                    ("GET", f"/%58iaozhi/%4fta/%44/{syn}/../../"),
-                    ("GET", f"/xiaozhi/ota/d/{syn}/../../../"),
-                    ("GET", f"/xiaozhi/ota/d/{syn}/../../../../xiaozhi/v1/"),
-                    ("POST", f"/xiaozhi/ota/d/{syn}/../../../../mcp/vision/explain"),
-                    ("GET", f"/xiaozhi/ota/d/{syn}/../../download/fw_1.0.bin"),
-                ):
-                    st_trav = _caddy_raw_http(
-                        live_port,
-                        raw_method,
-                        raw_trav,
-                        headers={"Content-Type": "application/json"} if raw_method == "POST" else None,
-                        body=b"{}" if raw_method == "POST" else None,
+                            return resp.status
+                        finally:
+                            conn.close()
+
+                    def _caddy_post_json(base_url: str, route: str, hdrs: dict, *, label: str) -> tuple[int, dict]:
+                        port = urlsplit(base_url).port or 0
+                        st, body = post_json(f"{base_url}{route}", hdrs)
+                        _record_last(label, port, "POST", route, st, json.dumps(body, ensure_ascii=False))
+                        return st, body
+
+                    def _caddy_get_status(base_url: str, route: str, *, label: str) -> int:
+                        port = urlsplit(base_url).port or 0
+                        try:
+                            with urllib.request.urlopen(f"{base_url}{route}", timeout=5) as resp:
+                                raw = resp.read().decode("utf-8", "replace")
+                                _record_last(label, port, "GET", route, resp.status, raw)
+                                return resp.status
+                        except urllib.error.HTTPError as exc:
+                            raw = exc.read().decode("utf-8", "replace")
+                            _record_last(label, port, "GET", route, exc.code, raw)
+                            return exc.code
+
+                    # 1. All literal, uppercase, percent-encoded credential queries, unexpected queries,
+                    #    and non-canonical OTA traversal paths must be rejected at the proxy (400 / 404)
+                    #    with ZERO hits on both counting upstreams.
+                    for qk in sorted(SENSITIVE_QUERY_KEYS):
+                        enc_l = f"%{ord(qk[0].lower()):02x}{qk[1:]}"
+                        enc_u = f"%{ord(qk[0].upper()):02X}{qk[1:]}"
+                        for q_pair in (
+                            f"{qk}={q_syn}",
+                            f"{qk.upper()}={q_syn}",
+                            f"{enc_l}={q_syn}",
+                            f"{enc_u}={q_syn}",
+                            f"from=mqtt_gateway&{enc_l}={q_syn}",
+                        ):
+                            for route_path in (
+                                "/xiaozhi/ota/",
+                                f"/xiaozhi/ota/d/{syn}/",
+                                "/mcp/vision/explain",
+                                "/xiaozhi/v1/",
+                            ):
+                                st_cq, _ = _caddy_post_json(
+                                    live_base,
+                                    f"{route_path}?{q_pair}",
+                                    {"Device-Id": dev_a["device_id"], "Client-Id": dev_a["client_id"]},
+                                    label="caddy_live",
+                                )
+                                assert st_cq == 400, f"Real caddy failed to reject {route_path}?{q_pair}: {st_cq}"
+                    for bad_get in (
+                        f"/xiaozhi/ota/?%74oken={q_syn}",
+                        f"/xiaozhi/ota/?%54oken={q_syn}",
+                        f"/xiaozhi/ota/?probe={benign_q}",
+                        "/xiaozhi/ota/?from=mqtt_gateway",
+                        "/xiaozhi/v1/?%66rom=mqtt_gateway",
+                        "/xiaozhi/v1/?FROM=MQTT_GATEWAY",
+                    ):
+                        st_bg = _caddy_get_status(live_base, bad_get, label="caddy_live")
+                        assert st_bg == 400, f"Real caddy returned {st_bg} for GET {bad_get}"
+                    for raw_method, raw_trav in (
+                        ("GET", f"/xiaozhi/ota/d/{syn}/.."),
+                        ("GET", f"/xiaozhi/ota/d/{syn}/../../"),
+                        ("GET", f"/xiaozhi/ota/d/{syn}/../.."),
+                        ("GET", f"/xiaozhi/ota/d/{syn}/%2e%2e/%2e%2e/"),
+                        ("GET", f"/xiaozhi/ota/d/{syn}/%2e%2e/%2e%2e"),
+                        ("GET", f"/%78iaozhi/ota/d/{syn}/../../"),
+                        ("GET", f"/%78%69%61%6f%7a%68%69/%6f%74%61/%64/{syn}/../../"),
+                        ("GET", f"/xiaozhi/ota/d/{syn}/..%2f../"),
+                        ("GET", f"/%58iaozhi/%4fta/%44/{syn}/../../"),
+                        ("GET", f"/xiaozhi/ota/d/{syn}/../../../"),
+                        ("GET", f"/xiaozhi/ota/d/{syn}/../../../../xiaozhi/v1/"),
+                        ("POST", f"/xiaozhi/ota/d/{syn}/../../../../mcp/vision/explain"),
+                        ("GET", f"/xiaozhi/ota/d/{syn}/../../download/fw_1.0.bin"),
+                    ):
+                        st_trav = _caddy_raw_http(
+                            live_port,
+                            raw_method,
+                            raw_trav,
+                            headers={"Content-Type": "application/json"} if raw_method == "POST" else None,
+                            body=b"{}" if raw_method == "POST" else None,
+                            label="caddy_live",
+                        )
+                        assert st_trav == 400, f"Real caddy failed to reject traversal {raw_method} {raw_trav}: {st_trav}"
+                    for raw_onedot in (
+                        f"/xiaozhi/ota/d/{syn}/../",
+                        f"/xiaozhi/ota/d/{syn}/%2e%2e/",
+                        f"/%78iaozhi/ota/d/{syn}/../",
+                    ):
+                        st_404 = _caddy_raw_http(live_port, "GET", raw_onedot, label="caddy_live")
+                        assert st_404 == 404, f"Real caddy single-dot negative control {raw_onedot} returned {st_404}"
+                    with cnt_http_lock:
+                        assert cnt_http_hits == [], f"Rejected requests hit Caddy HTTP counting upstream: {cnt_http_hits}"
+                    with cnt_ws_lock:
+                        assert cnt_ws_hits == [], f"Rejected requests hit Caddy WS counting upstream: {cnt_ws_hits}"
+
+                    # 2. Normal permitted requests must actually forward to the counting upstreams.
+                    assert _caddy_get_status(live_base, "/xiaozhi/ota/", label="caddy_live") == 200
+                    assert _caddy_get_status(live_base, "/xiaozhi/ota/download/fw_1.0.bin", label="caddy_live") == 200
+                    st_sec, _ = _caddy_post_json(
+                        live_base,
+                        f"/xiaozhi/ota/d/{syn}/",
+                        {
+                            "Device-Id": dev_a["device_id"],
+                            "Client-Id": dev_a["client_id"],
+                            "X-Original-URI": f"/xiaozhi/ota/d/{syn}/",
+                            "Referer": f"https://proxy.example/xiaozhi/ota/d/{syn}/",
+                            "Authorization": f"Bearer {bearer_syn}",
+                        },
+                        label="caddy_live",
                     )
-                    assert st_trav == 400, f"Real caddy failed to reject traversal {raw_method} {raw_trav}: {st_trav}"
-                for raw_onedot in (
-                    f"/xiaozhi/ota/d/{syn}/../",
-                    f"/xiaozhi/ota/d/{syn}/%2e%2e/",
-                    f"/%78iaozhi/ota/d/{syn}/../",
-                ):
-                    st_404 = _caddy_raw_http(live_port, "GET", raw_onedot)
-                    assert st_404 == 404, f"Real caddy single-dot negative control {raw_onedot} returned {st_404}"
-                with cnt_http_lock:
-                    assert cnt_http_hits == [], f"Rejected requests hit Caddy HTTP counting upstream: {cnt_http_hits}"
-                with cnt_ws_lock:
-                    assert cnt_ws_hits == [], f"Rejected requests hit Caddy WS counting upstream: {cnt_ws_hits}"
-
-                # 2. Normal permitted requests must actually forward to the counting upstreams.
-                with urllib.request.urlopen(f"{live_base}/xiaozhi/ota/", timeout=5) as r_ok_ota:
-                    assert r_ok_ota.status == 200
-                with urllib.request.urlopen(f"{live_base}/xiaozhi/ota/download/fw_1.0.bin", timeout=5) as r_ok_dl:
-                    assert r_ok_dl.status == 200
-                st_sec, _ = post_json(
-                    f"{live_base}/xiaozhi/ota/d/{syn}/",
-                    {
-                        "Device-Id": dev_a["device_id"],
-                        "Client-Id": dev_a["client_id"],
-                        "X-Original-URI": f"/xiaozhi/ota/d/{syn}/",
-                        "Referer": f"https://proxy.example/xiaozhi/ota/d/{syn}/",
-                        "Authorization": f"Bearer {bearer_syn}",
-                    },
-                )
-                assert st_sec == 200, st_sec
-                st_sec_enc, _ = post_json(
-                    f"{live_base}/%78iaozhi/%6fta/%64/{syn}/",
-                    {"Device-Id": dev_a["device_id"], "Client-Id": dev_a["client_id"]},
-                )
-                assert st_sec_enc == 200, st_sec_enc
-                st_extra_404, _ = post_json(f"{live_base}/xiaozhi/ota/d/{syn}/extra", {})
-                assert st_extra_404 == 404, st_extra_404
-                with urllib.request.urlopen(f"{live_base}/xiaozhi/v1/?from=mqtt_gateway", timeout=5) as r_ok_ws:
-                    assert r_ok_ws.status == 200
-
-                with cnt_http_lock:
-                    assert len(cnt_http_hits) == 4, f"Expected 4 HTTP upstream hits, got {cnt_http_hits}"
-                    assert cnt_http_hits[0]["path"] == "/xiaozhi/ota/"
-                    assert cnt_http_hits[1]["path"] == "/xiaozhi/ota/download/fw_1.0.bin"
-                    assert cnt_http_hits[2]["path"] == "/xiaozhi/ota/"
-                    assert cnt_http_hits[2]["headers"].get("x-ota-secret") == syn
-                    for scrubbed in ("authorization", "x-original-uri", "referer"):
-                        assert scrubbed not in cnt_http_hits[2]["headers"], f"Caddy leaked {scrubbed} upstream"
-                    assert cnt_http_hits[3]["path"] == "/xiaozhi/ota/"
-                    assert cnt_http_hits[3]["headers"].get("x-ota-secret") == syn
-                with cnt_ws_lock:
-                    assert len(cnt_ws_hits) == 1 and cnt_ws_hits[0]["path"] == "/xiaozhi/v1/?from=mqtt_gateway"
-
-                # 3. Dead upstream site: disallowed query & traversal paths return 400 (no 502),
-                #    single-dot returns 404, while valid requests trigger real 502.
-                try:
-                    with urllib.request.urlopen(f"{dead_base}/xiaozhi/ota/?%74oken={q_syn}", timeout=5):
-                        raise AssertionError("Expected 400 on dead Caddy site ?%74oken")
-                except urllib.error.HTTPError as exc:
-                    assert exc.code == 400
-                for dead_trav in (
-                    f"/xiaozhi/ota/d/{syn}/../../",
-                    f"/xiaozhi/ota/d/{syn}/..",
-                    f"/%78iaozhi/ota/d/{syn}/../../",
-                ):
-                    assert _caddy_raw_http(dead_proxy_port, "GET", dead_trav) == 400, dead_trav
-                assert _caddy_raw_http(dead_proxy_port, "GET", f"/xiaozhi/ota/d/{syn}/../") == 404
-                st_502_sec, _ = post_json(
-                    f"{dead_base}/xiaozhi/ota/d/{syn}/",
-                    {
-                        "Referer": f"https://proxy.example/xiaozhi/ota/d/{syn}/",
-                        "Authorization": f"Bearer {bearer_syn}",
-                    },
-                )
-                assert st_502_sec == 502, st_502_sec
-                st_502_ota, _ = post_json(
-                    f"{dead_base}/xiaozhi/ota/",
-                    {"Referer": f"https://proxy.example/xiaozhi/ota/d/{syn}/"},
-                )
-                assert st_502_ota == 502, st_502_ota
-                try:
-                    with urllib.request.urlopen(f"{dead_base}/xiaozhi/v1/?from=mqtt_gateway", timeout=5):
-                        raise AssertionError("Expected 502 on dead Caddy WS route")
-                except urllib.error.HTTPError as exc:
-                    assert exc.code == 502
-
-                _wait_for_log_substring([err_log], "502")
-                _wait_for_log_substring([live_acc_log], "[REDACTED]")
-                _wait_for_log_substring([dead_acc_log], "[REDACTED]")
-            finally:
-                if proc.poll() is None:
-                    proc.terminate()
-                _, caddy_stderr = proc.communicate(timeout=5)
-
-            # 4. Error & access log files MUST exist, be non-empty, and be strictly redacted.
-            assert err_log.is_file() and err_log.stat().st_size > 0, (
-                f"Expected non-empty Caddy error log at {err_log}"
-            )
-            assert live_acc_log.is_file() and live_acc_log.stat().st_size > 0, (
-                f"Expected non-empty Caddy live access log at {live_acc_log}"
-            )
-            assert dead_acc_log.is_file() and dead_acc_log.stat().st_size > 0, (
-                f"Expected non-empty Caddy dead access log at {dead_acc_log}"
-            )
-
-            err_records = [json.loads(ln) for ln in err_log.read_text(encoding="utf-8").splitlines() if ln.strip()]
-            assert any(
-                str(r.get("logger", "")).startswith("http.log.error") and r.get("status") == 502
-                for r in err_records
-            ), f"Caddy error log missing 502 record: {err_records}"
-            for rec in err_records:
-                req_obj = rec.get("request")
-                if isinstance(req_obj, dict):
-                    assert req_obj.get("uri") == "[REDACTED]", f"Unredacted request.uri in Caddy err_log: {rec}"
-                    assert req_obj.get("orig_uri", "[REDACTED]") == "[REDACTED]", (
-                        f"Unredacted request.orig_uri in Caddy err_log: {rec}"
+                    assert st_sec == 200, st_sec
+                    st_sec_enc, _ = _caddy_post_json(
+                        live_base,
+                        f"/%78iaozhi/%6fta/%64/{syn}/",
+                        {"Device-Id": dev_a["device_id"], "Client-Id": dev_a["client_id"]},
+                        label="caddy_live",
                     )
-                    hdrs = req_obj.get("headers") or {}
-                    for hk in ("Authorization", "X-Ota-Secret", "Referer", "X-Original-Uri"):
-                        if hk in hdrs:
-                            assert hdrs[hk] == "[REDACTED]", f"Unredacted {hk} in Caddy err_log: {rec}"
+                    assert st_sec_enc == 200, st_sec_enc
+                    st_extra_404, _ = _caddy_post_json(live_base, f"/xiaozhi/ota/d/{syn}/extra", {}, label="caddy_live")
+                    assert st_extra_404 == 404, st_extra_404
+                    assert _caddy_get_status(live_base, "/xiaozhi/v1/?from=mqtt_gateway", label="caddy_live") == 200
 
-            live_acc_records = [
-                json.loads(ln) for ln in live_acc_log.read_text(encoding="utf-8").splitlines() if ln.strip()
-            ]
-            assert len(live_acc_records) == 3, (
-                f"Expected 3 redacted live access records (OTA/d & 400 skipped), got {len(live_acc_records)}"
-            )
-            for rec in live_acc_records:
-                assert rec["request"]["uri"] == "[REDACTED]"
+                    with cnt_http_lock:
+                        assert len(cnt_http_hits) == 4, f"Expected 4 HTTP upstream hits, got {cnt_http_hits}"
+                        assert cnt_http_hits[0]["path"] == "/xiaozhi/ota/"
+                        assert cnt_http_hits[1]["path"] == "/xiaozhi/ota/download/fw_1.0.bin"
+                        assert cnt_http_hits[2]["path"] == "/xiaozhi/ota/"
+                        assert cnt_http_hits[2]["headers"].get("x-ota-secret") == syn
+                        for scrubbed in ("authorization", "x-original-uri", "referer"):
+                            assert scrubbed not in cnt_http_hits[2]["headers"], f"Caddy leaked {scrubbed} upstream"
+                        assert cnt_http_hits[3]["path"] == "/xiaozhi/ota/"
+                        assert cnt_http_hits[3]["headers"].get("x-ota-secret") == syn
+                    with cnt_ws_lock:
+                        assert len(cnt_ws_hits) == 1 and cnt_ws_hits[0]["path"] == "/xiaozhi/v1/?from=mqtt_gateway"
 
-            dead_acc_records = [
-                json.loads(ln) for ln in dead_acc_log.read_text(encoding="utf-8").splitlines() if ln.strip()
-            ]
-            assert len(dead_acc_records) == 2, (
-                f"Expected 2 redacted dead access records (OTA/d & 400 skipped), got {len(dead_acc_records)}"
-            )
+                    # 3. Dead upstream site: disallowed query & traversal paths return 400 (no 502),
+                    #    single-dot returns 404, while valid requests trigger real 502.
+                    st_dead_q = _caddy_get_status(dead_base, f"/xiaozhi/ota/?%74oken={q_syn}", label="caddy_dead")
+                    assert st_dead_q == 400, f"Expected 400 on dead Caddy site ?%74oken, got {st_dead_q}"
+                    for dead_trav in (
+                        f"/xiaozhi/ota/d/{syn}/../../",
+                        f"/xiaozhi/ota/d/{syn}/..",
+                        f"/%78iaozhi/ota/d/{syn}/../../",
+                    ):
+                        assert _caddy_raw_http(dead_proxy_port, "GET", dead_trav, label="caddy_dead") == 400, dead_trav
+                    assert _caddy_raw_http(dead_proxy_port, "GET", f"/xiaozhi/ota/d/{syn}/../", label="caddy_dead") == 404
+                    st_502_sec, _ = _caddy_post_json(
+                        dead_base,
+                        f"/xiaozhi/ota/d/{syn}/",
+                        {
+                            "Referer": f"https://proxy.example/xiaozhi/ota/d/{syn}/",
+                            "Authorization": f"Bearer {bearer_syn}",
+                        },
+                        label="caddy_dead_502_secret",
+                    )
+                    assert st_502_sec == 502, st_502_sec
+                    st_502_ota, _ = _caddy_post_json(
+                        dead_base,
+                        "/xiaozhi/ota/",
+                        {"Referer": f"https://proxy.example/xiaozhi/ota/d/{syn}/"},
+                        label="caddy_dead_502_ota",
+                    )
+                    assert st_502_ota == 502, st_502_ota
+                    st_502_ws = _caddy_get_status(dead_base, "/xiaozhi/v1/?from=mqtt_gateway", label="caddy_dead_502_ws")
+                    assert st_502_ws == 502, f"Expected 502 on dead Caddy WS route, got {st_502_ws}"
+                    port_pool.assert_dead_ports_unreachable("real_caddy_after_502")
 
-            joined = "\n".join(
-                [
-                    err_log.read_text(encoding="utf-8", errors="replace"),
-                    live_acc_log.read_text(encoding="utf-8", errors="replace"),
-                    dead_acc_log.read_text(encoding="utf-8", errors="replace"),
-                    caddy_stderr,
+                    _wait_for_log_substring([err_log], "502")
+                    _wait_for_log_substring([live_acc_log], "[REDACTED]")
+                    _wait_for_log_substring([dead_acc_log], "[REDACTED]")
+                finally:
+                    if proc.poll() is None:
+                        proc.terminate()
+                    _, caddy_stderr = proc.communicate(timeout=5)
+
+                # 4. Error & access log files MUST exist, be non-empty, and be strictly redacted.
+                assert err_log.is_file() and err_log.stat().st_size > 0, (
+                    f"Expected non-empty Caddy error log at {err_log}"
+                )
+                assert live_acc_log.is_file() and live_acc_log.stat().st_size > 0, (
+                    f"Expected non-empty Caddy live access log at {live_acc_log}"
+                )
+                assert dead_acc_log.is_file() and dead_acc_log.stat().st_size > 0, (
+                    f"Expected non-empty Caddy dead access log at {dead_acc_log}"
+                )
+
+                err_records = [json.loads(ln) for ln in err_log.read_text(encoding="utf-8").splitlines() if ln.strip()]
+                assert any(
+                    str(r.get("logger", "")).startswith("http.log.error")
+                    and r.get("status") == 502
+                    and f"127.0.0.1:{dead_port}" in str(r.get("msg", ""))
+                    and "connection refused" in str(r.get("msg", "")).lower()
+                    for r in err_records
+                ), f"Caddy error log missing 502 record targeting held dead_port={dead_port}: {err_records}"
+                for rec in err_records:
+                    req_obj = rec.get("request")
+                    if isinstance(req_obj, dict):
+                        assert req_obj.get("uri") == "[REDACTED]", f"Unredacted request.uri in Caddy err_log: {rec}"
+                        assert req_obj.get("orig_uri", "[REDACTED]") == "[REDACTED]", (
+                            f"Unredacted request.orig_uri in Caddy err_log: {rec}"
+                        )
+                        hdrs = req_obj.get("headers") or {}
+                        for hk in ("Authorization", "X-Ota-Secret", "Referer", "X-Original-Uri"):
+                            if hk in hdrs:
+                                assert hdrs[hk] == "[REDACTED]", f"Unredacted {hk} in Caddy err_log: {rec}"
+
+                live_acc_records = [
+                    json.loads(ln) for ln in live_acc_log.read_text(encoding="utf-8").splitlines() if ln.strip()
                 ]
-            )
-            assert "http.log.error" not in caddy_stderr and "http.handlers.reverse_proxy" not in caddy_stderr, (
-                "Caddy stderr unexpectedly captured error/reverse_proxy loggers"
-            )
-            for secret_val in {syn, q_syn, bearer_syn, benign_q, dev_a["ota_secret"]}:
-                assert secret_val not in joined, "Real caddy log/stderr leaked secret!"
-            assert "/xiaozhi/ota/d/" not in joined, "Real caddy log/stderr recorded /xiaozhi/ota/d/!"
+                assert len(live_acc_records) == 3, (
+                    f"Expected 3 redacted live access records (OTA/d & 400 skipped), got {len(live_acc_records)}"
+                )
+                for rec in live_acc_records:
+                    assert rec["request"]["uri"] == "[REDACTED]"
 
-            # 5. Persistence must remain disabled and host Caddy state directories untouched.
-            assert not (iso_dirs["xdg_config"] / "caddy" / "autosave.json").exists(), (
-                "persist_config off failed: autosave.json written to isolated XDG_CONFIG_HOME"
-            )
-            assert not (iso_dirs["home"] / ".config" / "caddy" / "autosave.json").exists(), (
-                "persist_config off failed: autosave.json written to isolated HOME"
-            )
-            _assert_host_caddy_state_unchanged(host_before, "post-real-caddy acceptance")
+                dead_acc_records = [
+                    json.loads(ln) for ln in dead_acc_log.read_text(encoding="utf-8").splitlines() if ln.strip()
+                ]
+                assert len(dead_acc_records) == 2, (
+                    f"Expected 2 redacted dead access records (OTA/d & 400 skipped), got {len(dead_acc_records)}"
+                )
+
+                joined = "\n".join(
+                    [
+                        err_log.read_text(encoding="utf-8", errors="replace"),
+                        live_acc_log.read_text(encoding="utf-8", errors="replace"),
+                        dead_acc_log.read_text(encoding="utf-8", errors="replace"),
+                        caddy_stderr,
+                    ]
+                )
+                assert "http.log.error" not in caddy_stderr and "http.handlers.reverse_proxy" not in caddy_stderr, (
+                    "Caddy stderr unexpectedly captured error/reverse_proxy loggers"
+                )
+                for secret_val in forbidden_all:
+                    assert secret_val not in joined, "Real caddy log/stderr leaked secret!"
+                assert "/xiaozhi/ota/d/" not in joined, "Real caddy log/stderr recorded /xiaozhi/ota/d/!"
+                port_pool.assert_dead_ports_unreachable("real_caddy_end")
+
+                # 5. Persistence must remain disabled and host Caddy state directories untouched.
+                assert not (iso_dirs["xdg_config"] / "caddy" / "autosave.json").exists(), (
+                    "persist_config off failed: autosave.json written to isolated XDG_CONFIG_HOME"
+                )
+                assert not (iso_dirs["home"] / ".config" / "caddy" / "autosave.json").exists(), (
+                    "persist_config off failed: autosave.json written to isolated HOME"
+                )
+                _assert_host_caddy_state_unchanged(host_before, "post-real-caddy acceptance")
+            except BaseException as exc:
+                diag_path = _save_proxy_failure_diag(
+                    "real-caddy",
+                    port_map=port_pool.port_map(),
+                    dead_hold_state=port_pool.dead_hold_state(),
+                    last_response=last_response or None,
+                    log_files={
+                        "caddy_error": err_log,
+                        "caddy_live_access": live_acc_log,
+                        "caddy_dead_access": dead_acc_log,
+                    },
+                    extra_logs={"caddy_stderr": caddy_stderr} if caddy_stderr else None,
+                    forbidden_secrets=forbidden_all,
+                    error=exc,
+                )
+                print(f"[DIAG] saved redacted real-caddy failure diagnostics to {diag_path}", file=sys.stderr)
+                raise
     finally:
         cnt_http_srv.shutdown()
         cnt_http_srv.server_close()
@@ -5405,7 +5853,8 @@ def test_real_caddy_adapt_and_routing(ota_base: str, dev_a: dict) -> set[str]:
         cnt_ws_srv.server_close()
 
     print(
-        f"[PASS] real {caddy_ver} (loopback 127.0.0.1, caddy adapt rc=0): counting upstream zero-hit/forward, "
+        f"[PASS] real {caddy_ver} (loopback 127.0.0.1, distinct listen ports {live_port}/{dead_proxy_port}, "
+        f"held dead_port={dead_port}, caddy adapt rc=0): counting upstream zero-hit/forward, "
         f"502 redacted error log, and host persistence isolation verified"
     )
     return set()
@@ -5599,6 +6048,7 @@ from config.config_loader import load_config
 import core.handle.abortHandle as abort_handle
 import core.handle.receiveAudioHandle as receive_audio_handle
 import core.handle.reportHandle as report_handle
+import core.handle.textHandler.abortMessageHandler as abort_msg_handler
 
 events_log = []
 
@@ -5629,6 +6079,22 @@ class FakeWS:
     async def close(self):
         self.closed = True
 
+class SpyVAD:
+    def __init__(self, next_voice=False):
+        self.calls = 0
+        self.next_voice = next_voice
+        self.released = 0
+    def is_vad(self, conn, pcm_frame):
+        self.calls += 1
+        if self.next_voice:
+            conn.client_have_voice = True
+        return self.next_voice
+    def release_conn_resources(self, conn):
+        self.released += 1
+        for attr in ("_vad_state", "_vad_context"):
+            if hasattr(conn, attr):
+                delattr(conn, attr)
+
 class ControllableASR(ASRProviderBase):
     def __init__(self, output_dir):
         super().__init__()
@@ -5640,11 +6106,14 @@ class ControllableASR(ASRProviderBase):
         self.release = None
         self.swallow_cancel = False
         self.next_text = "ok"
+        self.call_count = 0
 
     async def speech_to_text(self, opus_data, session_id, artifacts=None):
+        self.call_count += 1
         return self.next_text, None
 
     async def speech_to_text_wrapper(self, pcm_data, session_id):
+        self.call_count += 1
         if self.started is not None:
             self.started.set()
         if self.release is not None:
@@ -5750,7 +6219,8 @@ async def run():
         await asr_cl.receive_audio(conn_cl, b"\\x00" * 1920, False)
         assert conn_cl._passport_asr_task is None
 
-        # 4. Barge-in when client_is_speaking=True must NOT self-cancel the winning ASR task.
+        # 4. Barge-in when client_is_speaking=True must NOT self-cancel the winning ASR task
+        #    or discard newly buffered/queued audio.
         asr_bi = ControllableASR(os.environ["TEST_AUDIO_OUT"])
         asr_bi.next_text = f"BARGE_IN_{mode.upper()}"
         conn_bi = ConnectionHandler(cfg, None, asr_bi, None, None, None)
@@ -5767,13 +6237,141 @@ async def run():
         await asr_bi.receive_audio(conn_bi, b"\\x00" * 1920, False)
         bi_task = conn_bi._passport_asr_task
         assert bi_task is not None
+        conn_bi.asr_audio.append(b"\\x02\\x00" * 960)
+        conn_bi.asr_audio_queue.put(b"\\x03\\x00" * 960)
+        epoch_before_bi = conn_bi._passport_audio_epoch
         await asyncio.wait_for(bi_task, 1.0)
         assert events_log == [
             ("enqueue", mode, f"BARGE_IN_{mode.upper()}"),
             ("chat", mode, f"BARGE_IN_{mode.upper()}"),
         ], f"{mode} barge-in self-cancelled winning ASR task: {events_log}"
         assert conn_bi.websocket.sent, "barge-in did not send tts.stop before chat"
+        assert conn_bi._passport_audio_epoch == epoch_before_bi
+        assert len(conn_bi.asr_audio) == 1 and not conn_bi.asr_audio_queue.empty()
         await conn_bi.close()
+
+        # 5. Pre-VAD abort (before sentence end, no ASR task yet) clears buffers, resets VAD state,
+        #    invalidates queued + pre-popped frames, blocks stale silence dispatch, and allows recovery.
+        asr_pre = ControllableASR(os.environ["TEST_AUDIO_OUT"])
+        asr_pre.next_text = f"STALE_PRE_VAD_{mode.upper()}"
+        conn_pre = ConnectionHandler(cfg, None, asr_pre, None, None, None)
+        conn_pre.loop = asyncio.get_running_loop()
+        conn_pre.vad = SpyVAD(next_voice=False)
+        conn_pre.asr = asr_pre
+        conn_pre.websocket = FakeWS()
+        conn_pre.client_listen_mode = mode
+        conn_pre.asr_audio = [b"\\x01\\x00" * 960 for _ in range(17)]  # 32,640 bytes > 28,800
+        conn_pre.client_have_voice = True
+        conn_pre.client_voice_stop = False
+        conn_pre.client_audio_buffer.extend(b"\\x02\\x00" * 200)
+        conn_pre.client_voice_window.append(True)
+        conn_pre._vad_state = "stale"
+        conn_pre._vad_context = "stale"
+        assert conn_pre._passport_asr_task is None
+        conn_pre.asr_audio_queue.put(b"\\x05\\x00" * 960)
+        conn_pre.asr_audio_queue.put(b"\\x06\\x00" * 960)
+        pre_popped = conn_pre.asr_audio_queue.get_nowait()
+        events_log.clear()
+
+        await abort_handle.handleAbortMessage(conn_pre)
+        assert conn_pre.asr_audio == [], conn_pre.asr_audio
+        assert conn_pre.client_have_voice is False
+        assert conn_pre.client_voice_stop is False
+        assert len(conn_pre.client_audio_buffer) == 0
+        assert len(conn_pre.client_voice_window) == 0
+        assert conn_pre.asr_audio_queue.empty()
+        assert not hasattr(conn_pre, "_vad_state") and not hasattr(conn_pre, "_vad_context")
+        assert conn_pre.vad.released == 1
+        assert conn_pre._passport_audio_epoch == 1
+        assert conn_pre._passport_asr_task is None
+
+        # Stale frame already popped before abort must be ignored on event loop.
+        await receive_audio_handle.handleAudioMessage(conn_pre, pre_popped)
+        assert conn_pre.vad.calls == 0
+        assert conn_pre.asr_audio == []
+
+        # Subsequent silence / voice_stop must NOT dispatch stale ASR or trigger report/chat.
+        conn_pre.client_voice_stop = True
+        await asr_pre.receive_audio(conn_pre, b"\\x00" * 1920, False)
+        assert conn_pre._passport_asr_task is None
+        assert asr_pre.call_count == 0
+        assert events_log == [], f"{mode} pre-VAD abort leaked to report/chat: {events_log}"
+
+        # Also verify abortMessageHandler path directly on queued/buffered state.
+        conn_pre.client_voice_stop = False
+        conn_pre.asr_audio = [b"\\x07\\x00" * 960 for _ in range(17)]
+        conn_pre.client_have_voice = True
+        conn_pre.asr_audio_queue.put(b"\\x08\\x00" * 960)
+        await abort_msg_handler.handleAbortMessage(conn_pre)
+        assert conn_pre.asr_audio == [] and conn_pre.client_have_voice is False
+        assert conn_pre.asr_audio_queue.empty() and conn_pre._passport_audio_epoch == 2
+
+        # Fresh audio after pre-VAD abort on the SAME connection completes cleanly.
+        asr_pre.next_text = f"FRESH_{mode.upper()}_POST_ABORT"
+        conn_pre.vad.next_voice = True
+        conn_pre.asr_audio_queue.put(b"\\x09\\x00" * 960)
+        fresh_frame = conn_pre.asr_audio_queue.get_nowait()
+        await receive_audio_handle.handleAudioMessage(conn_pre, fresh_frame)
+        assert conn_pre.vad.calls == 1 and len(conn_pre.asr_audio) == 1
+        conn_pre.asr_audio.append(pcm_chunk)
+        conn_pre.client_voice_stop = True
+        await asr_pre.receive_audio(conn_pre, b"\\x00" * 1920, False)
+        assert conn_pre._passport_asr_task is not None
+        await asyncio.wait_for(conn_pre._passport_asr_task, 1.0)
+        assert asr_pre.call_count == 1
+        assert events_log == [
+            ("enqueue", mode, f"FRESH_{mode.upper()}_POST_ABORT"),
+            ("chat", mode, f"FRESH_{mode.upper()}_POST_ABORT"),
+        ], f"{mode} post-abort recovery failed: {events_log}"
+        await conn_pre.close()
+
+        # 6. Pre-VAD disconnect (conn.close() before VAD sentence end) discards buffers & queued/pre-popped frames.
+        asr_pre_cl = ControllableASR(os.environ["TEST_AUDIO_OUT"])
+        asr_pre_cl.next_text = f"STALE_PRE_VAD_{mode.upper()}_CLOSE"
+        conn_pre_cl = ConnectionHandler(cfg, None, asr_pre_cl, None, None, None)
+        conn_pre_cl.loop = asyncio.get_running_loop()
+        conn_pre_cl.vad = SpyVAD(next_voice=False)
+        conn_pre_cl.asr = asr_pre_cl
+        conn_pre_cl.websocket = FakeWS()
+        conn_pre_cl.client_listen_mode = mode
+        conn_pre_cl.asr_audio = [b"\\x0a\\x00" * 960 for _ in range(17)]
+        conn_pre_cl.client_have_voice = True
+        conn_pre_cl.client_voice_stop = False
+        conn_pre_cl._vad_state = "stale"
+        conn_pre_cl.asr_audio_queue.put(b"\\x0b\\x00" * 960)
+        conn_pre_cl.asr_audio_queue.put(b"\\x0c\\x00" * 960)
+        pre_popped_cl = conn_pre_cl.asr_audio_queue.get_nowait()
+        events_log.clear()
+
+        await conn_pre_cl.close()
+        assert conn_pre_cl.stop_event.is_set()
+        assert conn_pre_cl.asr_audio == [] and conn_pre_cl.client_have_voice is False
+        assert conn_pre_cl.asr_audio_queue.empty()
+        assert not hasattr(conn_pre_cl, "_vad_state")
+        assert conn_pre_cl._passport_asr_task is None
+        await receive_audio_handle.handleAudioMessage(conn_pre_cl, pre_popped_cl)
+        conn_pre_cl.client_voice_stop = True
+        await asr_pre_cl.receive_audio(conn_pre_cl, b"\\x00" * 1920, False)
+        assert conn_pre_cl.vad.calls == 0 and asr_pre_cl.call_count == 0 and events_log == []
+
+        # 7. Server-side AEC barge-in inside handleAudioMessage sends tts.stop without wiping new speech.
+        asr_aec = ControllableASR(os.environ["TEST_AUDIO_OUT"])
+        conn_aec = ConnectionHandler(cfg, None, asr_aec, None, None, None)
+        conn_aec.loop = asyncio.get_running_loop()
+        conn_aec.vad = SpyVAD(next_voice=True)
+        conn_aec.asr = asr_aec
+        conn_aec.websocket = FakeWS()
+        conn_aec.client_listen_mode = mode
+        conn_aec.client_aec = True
+        conn_aec.client_is_speaking = True
+        conn_aec.asr_audio_queue.put(b"\\x0d\\x00" * 960)
+        await receive_audio_handle.handleAudioMessage(conn_aec, b"\\x0e\\x00" * 960)
+        assert conn_aec.websocket.sent, f"{mode} AEC barge-in did not send tts.stop"
+        assert conn_aec.client_have_voice is True
+        assert len(conn_aec.asr_audio) == 1
+        assert conn_aec._passport_audio_epoch == 0
+        assert not conn_aec.asr_audio_queue.empty()
+        await conn_aec.close()
 
 asyncio.run(run())
 """
@@ -5792,7 +6390,10 @@ asyncio.run(run())
         assert res.returncode == 0, (
             f"auto/realtime ASR unit cancel probe failed ({res.returncode}):\n{res.stdout}\n{res.stderr}"
         )
-    print("[PASS] auto/realtime ASR unit cancellation, stale-gen guard, close guard, and barge-in safety verified")
+    print(
+        "[PASS] auto/realtime ASR unit cancellation, pre-VAD abort/close discard, "
+        "stale-gen guard, close guard, and barge-in safety verified"
+    )
 
 
 async def _ws_expect_rejected(ws_url: str, headers: dict, label: str) -> None:
@@ -5843,11 +6444,13 @@ async def _send_vad_utterance(
     *,
     silence_count: int = 12,
     silence_interval_s: float = 0.035,
+    send_listen_start: bool = True,
 ) -> None:
-    """Send listen.start + speech + silence in auto/realtime mode until VAD triggers voice stop."""
-    await ws.send(
-        json.dumps({"session_id": session_id, "type": "listen", "state": "start", "mode": mode})
-    )
+    """Send listen.start (optional) + speech + silence in auto/realtime mode until VAD triggers voice stop."""
+    if send_listen_start:
+        await ws.send(
+            json.dumps({"session_id": session_id, "type": "listen", "state": "start", "mode": mode})
+        )
     for frame in speech_frames:
         await ws.send(frame)
     for _ in range(silence_count):
@@ -5862,9 +6465,17 @@ async def _run_vad_turn(
     speech_frames: list[bytes],
     silence_frame: bytes,
     timeout_s: float = 15.0,
+    send_listen_start: bool = True,
 ) -> dict:
     """Execute a complete VAD-triggered voice turn in auto or realtime mode and verify TTS completion."""
-    await _send_vad_utterance(ws, session_id, mode, speech_frames, silence_frame)
+    await _send_vad_utterance(
+        ws,
+        session_id,
+        mode,
+        speech_frames,
+        silence_frame,
+        send_listen_start=send_listen_start,
+    )
     texts: list[str] = []
     tts_states: list[str] = []
     decoded = 0
@@ -6408,6 +7019,184 @@ async def _run_live_server_regressions(
                 assert "合约测试" in "".join(turn_vdr["stt"]), (mode, turn_vdr)
                 assert turn_vdr["decoded_pcm_bytes"] > 0 and "stop" in turn_vdr["tts_states"], (mode, turn_vdr)
                 assert int(_get_json(f"{fake_url}/_stats")["llm_total"]) == llm_before_disc + 1
+
+        # 3h. Pre-VAD abort (before sentence end, no ASR task dispatched yet):
+        #     both buffered speech and queued speech frames are discarded so subsequent silence
+        #     never triggers STT/LLM, and the same connection recovers cleanly on the next turn.
+        pre_vad_frames = speech_frames[:20]  # 20 * 1920 = 38,400 bytes (>28,800 threshold), active speech ends at frame 19
+        for mode in ("auto", "realtime"):
+            stale_prevad = f"STALE_PREVAD_{mode.upper()}"
+            async with websockets.connect(ws_url, additional_headers=headers_a) as ws_pre:
+                hello_pre = await send_hello(ws_pre)
+                sid_pre = hello_pre["session_id"]
+                stats_before = _get_json(f"{fake_url}/_stats")
+                asr_before_pre = int(stats_before["asr_total"])
+                llm_before_pre = int(stats_before["llm_total"])
+
+                post_json(
+                    f"{fake_url}/_control",
+                    {},
+                    {"asr_delays": [0.0], "transcript": stale_prevad},
+                )
+                # (i) Abort after frames are buffered in conn.asr_audio with client_have_voice=True, before VAD end.
+                await ws_pre.send(
+                    json.dumps({"session_id": sid_pre, "type": "listen", "state": "start", "mode": mode})
+                )
+                for frame in pre_vad_frames:
+                    await ws_pre.send(frame)
+                await asyncio.sleep(0.12)
+
+                stats_mid = _get_json(f"{fake_url}/_stats")
+                assert int(stats_mid["asr_total"]) == asr_before_pre and int(stats_mid["asr_in_flight"]) == 0, (
+                    f"{mode} pre-VAD setup unexpectedly dispatched ASR before abort: {stats_mid}"
+                )
+
+                await ws_pre.send(
+                    json.dumps({"session_id": sid_pre, "type": "abort", "reason": "wake_word_detected"})
+                )
+                stop_deadline = time.monotonic() + 1.5
+                stop_seen = False
+                while time.monotonic() < stop_deadline:
+                    rem = max(0.01, stop_deadline - time.monotonic())
+                    raw_msg = await asyncio.wait_for(ws_pre.recv(), rem)
+                    if isinstance(raw_msg, bytes):
+                        continue
+                    assert stale_prevad not in raw_msg, f"{mode} pre-VAD abort leaked stale text: {raw_msg!r}"
+                    parsed_msg = json.loads(raw_msg)
+                    if parsed_msg.get("type") == "tts" and parsed_msg.get("state") == "stop":
+                        stop_seen = True
+                        break
+                assert stop_seen, f"{mode} did not receive tts.stop after pre-VAD abort"
+
+                # Feed silence (> 200ms min_silence_duration_ms); aborted audio must NOT trigger ASR or LLM.
+                for _ in range(12):
+                    await asyncio.sleep(0.035)
+                    await ws_pre.send(silence_frame)
+                obs_end = time.monotonic() + 0.35
+                while time.monotonic() < obs_end:
+                    rem = max(0.01, obs_end - time.monotonic())
+                    try:
+                        extra = await asyncio.wait_for(ws_pre.recv(), rem)
+                    except asyncio.TimeoutError:
+                        break
+                    if isinstance(extra, str):
+                        assert stale_prevad not in extra, f"{mode} pre-VAD abort leaked stale text on silence: {extra!r}"
+                stats_after_buf = _get_json(f"{fake_url}/_stats")
+                assert int(stats_after_buf["asr_total"]) == asr_before_pre, (
+                    f"{mode} buffered pre-VAD audio triggered ASR after abort+silence: {stats_after_buf}"
+                )
+                assert int(stats_after_buf["llm_total"]) == llm_before_pre, (
+                    f"{mode} buffered pre-VAD audio triggered LLM after abort+silence: {stats_after_buf}"
+                )
+
+                # (ii) Immediate pre-VAD abort while frames may still sit in asr_audio_queue.
+                for frame in pre_vad_frames:
+                    await ws_pre.send(frame)
+                await ws_pre.send(
+                    json.dumps({"session_id": sid_pre, "type": "abort", "reason": "wake_word_detected"})
+                )
+                stop_deadline2 = time.monotonic() + 1.5
+                stop_seen2 = False
+                while time.monotonic() < stop_deadline2:
+                    rem = max(0.01, stop_deadline2 - time.monotonic())
+                    raw_msg = await asyncio.wait_for(ws_pre.recv(), rem)
+                    if isinstance(raw_msg, bytes):
+                        continue
+                    assert stale_prevad not in raw_msg, f"{mode} queued pre-VAD abort leaked stale text: {raw_msg!r}"
+                    parsed_msg = json.loads(raw_msg)
+                    if parsed_msg.get("type") == "tts" and parsed_msg.get("state") == "stop":
+                        stop_seen2 = True
+                        break
+                assert stop_seen2, f"{mode} did not receive tts.stop after queued pre-VAD abort"
+
+                for _ in range(12):
+                    await asyncio.sleep(0.035)
+                    await ws_pre.send(silence_frame)
+                await asyncio.sleep(0.35)
+                stats_after_q = _get_json(f"{fake_url}/_stats")
+                assert int(stats_after_q["asr_total"]) == asr_before_pre, (
+                    f"{mode} queued pre-VAD audio triggered ASR after abort+silence: {stats_after_q}"
+                )
+                assert int(stats_after_q["llm_total"]) == llm_before_pre, (
+                    f"{mode} queued pre-VAD audio triggered LLM after abort+silence: {stats_after_q}"
+                )
+
+                # (iii) Same connection completes a fresh post-abort utterance (even without re-sending listen.start).
+                fresh_marker = f"FRESH_POST_ABORT_{mode.upper()}"
+                post_json(
+                    f"{fake_url}/_control",
+                    {},
+                    {"asr_delays": [0.0], "transcript": fresh_marker},
+                )
+                turn_fresh = await _run_vad_turn(
+                    ws_pre,
+                    sid_pre,
+                    mode,
+                    speech_frames,
+                    silence_frame,
+                    send_listen_start=False,
+                )
+                assert fresh_marker in "".join(turn_fresh["stt"]), (mode, turn_fresh)
+                assert turn_fresh["decoded_pcm_bytes"] > 0 and "stop" in turn_fresh["tts_states"], (mode, turn_fresh)
+                stats_after_fresh = _get_json(f"{fake_url}/_stats")
+                assert int(stats_after_fresh["asr_total"]) == asr_before_pre + 1
+                assert int(stats_after_fresh["llm_total"]) == llm_before_pre + 1
+
+        # 3i. Pre-VAD abrupt disconnect during buffering stage does not consume buffered/queued audio
+        #     after close, and reconnecting recovers cleanly in both auto and realtime modes.
+        for mode in ("auto", "realtime"):
+            stale_prevad_disc = f"STALE_PREVAD_DISC_{mode.upper()}"
+            stats_before_pd = _get_json(f"{fake_url}/_stats")
+            asr_before_pd = int(stats_before_pd["asr_total"])
+            llm_before_pd = int(stats_before_pd["llm_total"])
+            post_json(
+                f"{fake_url}/_control",
+                {},
+                {"asr_delays": [0.0], "transcript": stale_prevad_disc},
+            )
+            ws_pre_disc = await websockets.connect(ws_url, additional_headers=headers_a)
+            try:
+                hello_pd = await send_hello(ws_pre_disc)
+                await ws_pre_disc.send(
+                    json.dumps({"session_id": hello_pd["session_id"], "type": "listen", "state": "start", "mode": mode})
+                )
+                for frame in pre_vad_frames:
+                    await ws_pre_disc.send(frame)
+                await asyncio.sleep(0.12)
+                stats_mid_pd = _get_json(f"{fake_url}/_stats")
+                assert int(stats_mid_pd["asr_total"]) == asr_before_pd and int(stats_mid_pd["asr_in_flight"]) == 0
+                for _ in range(2):
+                    await asyncio.sleep(0.035)
+                    await ws_pre_disc.send(silence_frame)
+                if ws_pre_disc.transport is not None:
+                    ws_pre_disc.transport.abort()
+                else:
+                    await ws_pre_disc.close()
+            finally:
+                if ws_pre_disc.transport is not None and not ws_pre_disc.transport.is_closing():
+                    ws_pre_disc.transport.abort()
+
+            await asyncio.sleep(0.5)
+            stats_after_pd = _get_json(f"{fake_url}/_stats")
+            assert int(stats_after_pd["asr_total"]) == asr_before_pd, (
+                f"{mode} pre-VAD disconnected session unexpectedly dispatched ASR: {stats_after_pd}"
+            )
+            assert int(stats_after_pd["llm_total"]) == llm_before_pd, (
+                f"{mode} pre-VAD disconnected session unexpectedly triggered LLM: {stats_after_pd}"
+            )
+
+            rec_marker = f"RECONNECT_PREVAD_{mode.upper()}"
+            post_json(f"{fake_url}/_control", {}, {"asr_delays": [0.0], "transcript": rec_marker})
+            async with websockets.connect(ws_url, additional_headers=headers_a) as ws_pd_rec:
+                hello_pdr = await send_hello(ws_pd_rec)
+                turn_pdr = await _run_vad_turn(
+                    ws_pd_rec, hello_pdr["session_id"], mode, speech_frames, silence_frame
+                )
+                assert rec_marker in "".join(turn_pdr["stt"]), (mode, turn_pdr)
+                assert turn_pdr["decoded_pcm_bytes"] > 0 and "stop" in turn_pdr["tts_states"], (mode, turn_pdr)
+                stats_after_pdr = _get_json(f"{fake_url}/_stats")
+                assert int(stats_after_pdr["asr_total"]) == asr_before_pd + 1
+                assert int(stats_after_pdr["llm_total"]) == llm_before_pd + 1
     finally:
         post_json(f"{fake_url}/_control", {}, {"asr_delays": [], "transcript": "合约测试"})
 
@@ -6437,7 +7226,7 @@ async def _run_live_server_regressions(
     print(
         f"[PASS] blockers #1 & non-blocker #5: OTA/WS device auth, allowlist bypass closed, "
         f"Session B ({b_elapsed:.2f}s) completed while Session A still in flight, "
-        f"timeout, manual + auto/realtime abort cancel & disconnect cancel verified"
+        f"timeout, manual + auto/realtime pre-VAD & in-flight abort/disconnect cancel + recovery verified"
     )
     return {"secrets_to_check": issued_secrets}
 
@@ -6446,8 +7235,7 @@ def test_real_ttl_expiration(server_home: Path, fake_port: int) -> set[str]:
     """Verify a naturally issued token expires once expire_seconds elapses."""
     with tempfile.TemporaryDirectory() as tmpdir:
         tmp = Path(tmpdir)
-        ws_port = _free_port()
-        http_port = _free_port()
+        ws_port, http_port = _reserve_distinct_ports(2)
         auth_file = tmp / "auth_key"
         devices_file = tmp / "devices.yaml"
         log_dir = tmp / "logs"
@@ -6585,8 +7373,7 @@ def test_debug_and_provider_error_log_redaction(server_home: Path, fake_port: in
             tmp = Path(tmpdir)
 
             # --- Sub-run 1: Live DEBUG server hitting MCP JWT + ASR 500 echoed body + LLM + TTS 500 echoed body ---
-            ws_port_1 = _free_port()
-            http_port_1 = _free_port()
+            ws_port_1, http_port_1 = _reserve_distinct_ports(2)
             srv_home_1 = _make_srv_home(server_home, tmp / "srv_home_1")
             devices_1 = tmp / "devices_1.yaml"
             auth_1 = tmp / "auth_key_1"
@@ -6818,8 +7605,7 @@ def test_debug_and_provider_error_log_redaction(server_home: Path, fake_port: in
             )
 
             # --- Sub-run 2: Live DEBUG server with URL userinfo on ASR/LLM/TTS + direct LLM/TTS probe ---
-            ws_port_2 = _free_port()
-            http_port_2 = _free_port()
+            ws_port_2, http_port_2 = _reserve_distinct_ports(2)
             srv_home_2 = _make_srv_home(server_home, tmp / "srv_home_2")
             devices_2 = tmp / "devices_2.yaml"
             auth_2 = tmp / "auth_key_2"
@@ -7013,8 +7799,11 @@ def test_debug_and_provider_error_log_redaction(server_home: Path, fake_port: in
             )
 
             # Direct isolated probe of LLMProvider._apply_thinking_disabled and TTSProvider.text_to_speak userinfo redaction.
-            unused_port = _free_port()
-            probe_code = """
+            with _ReservedPortPool() as unused_pool:
+                unused_pool.register_external("fake_provider", fake_port)
+                unused_port = unused_pool.reserve_dead("unused_tts")
+                unused_pool.assert_all_disjoint("tts_userinfo_probe")
+                probe_code = """
 import asyncio, os, sys
 os.chdir(os.environ["XIAOZHI_HOME"])
 for p in (os.environ["PASSPORT_ROOT"], os.environ["XIAOZHI_HOME"]):
@@ -7060,23 +7849,23 @@ else:
 from loguru import logger
 logger.complete()
 """
-            probe_res = subprocess.run(
-                [sys.executable, "-c", probe_code],
-                env=_base_env(
-                    XIAOZHI_HOME=str(srv_home_2),
-                    PASSPORT_ROOT=str(ROOT),
-                    PASSPORT_LOG_DIR=str(srv_home_2 / "tmp"),
-                    PROBE_LLM_U=llm_user,
-                    PROBE_LLM_P=llm_pass,
-                    PROBE_TTS_U=tts_user,
-                    PROBE_TTS_P=tts_pass,
-                    PROBE_FAKE_PORT=str(fake_port),
-                    PROBE_UNUSED_PORT=str(unused_port),
-                ),
-                capture_output=True,
-                text=True,
-                timeout=15,
-            )
+                probe_res = subprocess.run(
+                    [sys.executable, "-c", probe_code],
+                    env=_base_env(
+                        XIAOZHI_HOME=str(srv_home_2),
+                        PASSPORT_ROOT=str(ROOT),
+                        PASSPORT_LOG_DIR=str(srv_home_2 / "tmp"),
+                        PROBE_LLM_U=llm_user,
+                        PROBE_LLM_P=llm_pass,
+                        PROBE_TTS_U=tts_user,
+                        PROBE_TTS_P=tts_pass,
+                        PROBE_FAKE_PORT=str(fake_port),
+                        PROBE_UNUSED_PORT=str(unused_port),
+                    ),
+                    capture_output=True,
+                    text=True,
+                    timeout=15,
+                )
             assert probe_res.returncode == 0, (
                 f"LLM/TTS userinfo probe failed: {probe_res.stdout}\n{probe_res.stderr}"
             )
@@ -7105,6 +7894,7 @@ def main() -> None:
         sys.exit(f"Upstream checkout not found at {server_home}; run run_isolated.sh or set XIAOZHI_HOME")
 
     test_unit_redaction_permissions_and_strict_abort()
+    test_port_fixture_mutual_exclusion_and_diag_redaction()
     test_concurrent_registry_locking_and_auth_key()
     test_real_mode_refuses_disabled_or_missing_auth(server_home)
     test_real_vs_demo_config_persistence(server_home)
@@ -7114,9 +7904,7 @@ def main() -> None:
 
     with tempfile.TemporaryDirectory() as tmpdir:
         tmp = Path(tmpdir)
-        fake_port = _free_port()
-        ws_port = _free_port()
-        http_port = _free_port()
+        fake_port, ws_port, http_port = _reserve_distinct_ports(3)
 
         srv_home = _make_srv_home(server_home, tmp / "srv_home")
         auth_file = tmp / "auth_key"

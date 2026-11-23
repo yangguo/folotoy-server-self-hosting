@@ -1,9 +1,12 @@
 """Ordered runtime patches applied on top of pinned xiaozhi-server v0.9.8."""
 
 import asyncio
+import contextvars
 import json
 import os
+import queue
 import time
+import traceback
 from typing import Optional
 from urllib.parse import urlsplit
 
@@ -26,6 +29,39 @@ from passport_server.redaction import (
 )
 
 _PATCHES_APPLIED = False
+_IN_INTERNAL_BARGE_IN: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "_passport_in_internal_barge_in", default=False
+)
+_CURRENT_AUDIO_FRAME_EPOCH: contextvars.ContextVar[Optional[int]] = contextvars.ContextVar(
+    "_passport_audio_frame_epoch", default=None
+)
+
+
+class _EpochAudioFrame:
+    """Inbound PCM frame tagged with the connection audio epoch active when queued."""
+
+    __slots__ = ("epoch", "pcm_frame")
+
+    def __init__(self, epoch: int, pcm_frame: bytes):
+        self.epoch = epoch
+        self.pcm_frame = pcm_frame
+
+
+class _PassportEpochAudioQueue(queue.Queue):
+    """Queue that tags inbound PCM frames with the connection's current audio epoch."""
+
+    def __init__(self, conn):
+        super().__init__()
+        self._conn = conn
+
+    def put(self, item, block=True, timeout=None):
+        stop_ev = getattr(self._conn, "stop_event", None)
+        if stop_ev is not None and stop_ev.is_set():
+            return
+        if not isinstance(item, _EpochAudioFrame):
+            epoch = int(getattr(self._conn, "_passport_audio_epoch", 0) or 0)
+            item = _EpochAudioFrame(epoch, item)
+        super().put(item, block=block, timeout=timeout)
 
 
 def _redact_loguru_record(record: dict) -> None:
@@ -103,6 +139,64 @@ def _dispatch_conn_asr_task(conn, asr_provider, asr_audio_task) -> Optional[asyn
     task._passport_asr_gen = gen
     conn._passport_asr_task = task
     return task
+
+
+def _next_conn_audio_epoch(conn) -> int:
+    """Advance and return the connection-scoped inbound audio epoch."""
+    epoch = int(getattr(conn, "_passport_audio_epoch", 0) or 0) + 1
+    conn._passport_audio_epoch = epoch
+    return epoch
+
+
+def _discard_conn_pending_audio(conn) -> int:
+    """Invalidate queued/pre-popped audio frames and reset VAD/ASR buffers on abort/close."""
+    epoch = _next_conn_audio_epoch(conn)
+    audio_q = getattr(conn, "asr_audio_queue", None)
+    if audio_q is not None:
+        while True:
+            try:
+                audio_q.get_nowait()
+            except queue.Empty:
+                break
+
+    reset_states = getattr(conn, "reset_audio_states", None)
+    if callable(reset_states):
+        reset_states()
+    else:
+        for attr in ("client_audio_buffer", "client_voice_window", "asr_audio"):
+            buf = getattr(conn, attr, None)
+            if buf is not None and hasattr(buf, "clear"):
+                buf.clear()
+        conn.client_have_voice = False
+        conn.client_voice_stop = False
+        conn.last_is_voice = False
+        conn.vad_last_voice_time = 0.0
+
+    vad = getattr(conn, "vad", None)
+    release_vad = getattr(vad, "release_conn_resources", None)
+    if callable(release_vad):
+        try:
+            release_vad(conn)
+        except Exception:
+            pass
+    for attr in ("_vad_state", "_vad_context"):
+        if hasattr(conn, attr):
+            try:
+                delattr(conn, attr)
+            except Exception:
+                pass
+    return epoch
+
+
+def _is_internal_barge_in_context(conn) -> bool:
+    """Return True when abort is triggered by internal playback barge-in rather than client abort."""
+    if _IN_INTERNAL_BARGE_IN.get():
+        return True
+    try:
+        current = asyncio.current_task()
+    except RuntimeError:
+        current = None
+    return current is not None and getattr(conn, "_passport_asr_task", None) is current
 
 
 def patch_logging() -> None:
@@ -295,11 +389,23 @@ def patch_abort_and_listen_and_hello() -> None:
     original_listen_handle = listen_msg_handler.ListenTextMessageHandler.handle
     original_enqueue_asr_report = asr_base.enqueue_asr_report
     original_start_to_chat = receive_audio_handle.startToChat
+    original_handle_audio_message = receive_audio_handle.handleAudioMessage
 
-    async def patched_abort(conn):
+    async def patched_internal_barge_in_abort(conn):
         _cancel_conn_asr_task(conn)
         conn.sentence_id = None
         await original_abort(conn)
+
+    async def patched_client_abort(conn):
+        _cancel_conn_asr_task(conn)
+        _discard_conn_pending_audio(conn)
+        conn.sentence_id = None
+        await original_abort(conn)
+
+    async def patched_abort(conn):
+        if _is_internal_barge_in_context(conn):
+            return await patched_internal_barge_in_abort(conn)
+        return await patched_client_abort(conn)
 
     def patched_enqueue_asr_report(conn, text, opus_data):
         if _is_stale_conn_asr_task(conn):
@@ -309,7 +415,57 @@ def patch_abort_and_listen_and_hello() -> None:
     async def patched_start_to_chat(conn, text):
         if _is_stale_conn_asr_task(conn):
             return None
-        return await original_start_to_chat(conn, text)
+        token = _IN_INTERNAL_BARGE_IN.set(True)
+        try:
+            return await original_start_to_chat(conn, text)
+        finally:
+            _IN_INTERNAL_BARGE_IN.reset(token)
+
+    async def patched_handle_audio_message(conn, pcm_frame):
+        stop_ev = getattr(conn, "stop_event", None)
+        if stop_ev is not None and stop_ev.is_set():
+            return None
+        if isinstance(pcm_frame, _EpochAudioFrame):
+            if pcm_frame.epoch != int(getattr(conn, "_passport_audio_epoch", 0) or 0):
+                return None
+            frame_epoch = pcm_frame.epoch
+            pcm_frame = pcm_frame.pcm_frame
+        else:
+            frame_epoch = int(getattr(conn, "_passport_audio_epoch", 0) or 0)
+        token = _CURRENT_AUDIO_FRAME_EPOCH.set(frame_epoch)
+        try:
+            return await original_handle_audio_message(conn, pcm_frame)
+        finally:
+            _CURRENT_AUDIO_FRAME_EPOCH.reset(token)
+
+    def patched_asr_text_priority_thread(self, conn):
+        while not conn.stop_event.is_set():
+            try:
+                message = conn.asr_audio_queue.get(timeout=1)
+                if conn.stop_event.is_set():
+                    break
+                if (
+                    isinstance(message, _EpochAudioFrame)
+                    and message.epoch != int(getattr(conn, "_passport_audio_epoch", 0) or 0)
+                ):
+                    continue
+                loop = getattr(conn, "loop", None)
+                if loop is None or loop.is_closed():
+                    break
+                future = asyncio.run_coroutine_threadsafe(
+                    asr_base.handleAudioMessage(conn, message),
+                    loop,
+                )
+                future.result()
+            except queue.Empty:
+                continue
+            except Exception as e:
+                if conn.stop_event.is_set():
+                    break
+                asr_base.logger.bind(tag=asr_base.TAG).error(
+                    f"处理ASR文本失败: {redact_text(str(e))}, 类型: {type(e).__name__}, 堆栈: {traceback.format_exc()}"
+                )
+                continue
 
     async def patched_hello(conn, msg_json):
         ready_event = getattr(conn, "_passport_ready_event", None)
@@ -338,6 +494,16 @@ def patch_abort_and_listen_and_hello() -> None:
         await original_hello(conn, msg_json)
 
     async def patched_receive_audio(self, conn, pcm_frame, audio_have_voice):
+        stop_ev = getattr(conn, "stop_event", None)
+        if stop_ev is not None and stop_ev.is_set():
+            return
+        frame_epoch = _CURRENT_AUDIO_FRAME_EPOCH.get()
+        if (
+            frame_epoch is not None
+            and frame_epoch != int(getattr(conn, "_passport_audio_epoch", 0) or 0)
+        ):
+            return
+
         if conn.client_listen_mode == "manual":
             conn.asr_audio.append(pcm_frame)
             return
@@ -358,6 +524,9 @@ def patch_abort_and_listen_and_hello() -> None:
                 _dispatch_conn_asr_task(conn, self, [pcm_bytes])
 
     async def patched_listen_handle(self, conn, msg_json):
+        stop_ev = getattr(conn, "stop_event", None)
+        if stop_ev is not None and stop_ev.is_set():
+            return
         if (
             msg_json.get("state") == "stop"
             and conn.asr is not None
@@ -375,8 +544,11 @@ def patch_abort_and_listen_and_hello() -> None:
         await original_listen_handle(self, conn, msg_json)
 
     abort_handle.handleAbortMessage = patched_abort
-    abort_msg_handler.handleAbortMessage = patched_abort
-    receive_audio_handle.handleAbortMessage = patched_abort
+    abort_msg_handler.handleAbortMessage = patched_client_abort
+    receive_audio_handle.handleAbortMessage = patched_internal_barge_in_abort
+    receive_audio_handle.handleAudioMessage = patched_handle_audio_message
+    asr_base.handleAudioMessage = patched_handle_audio_message
+    asr_base.ASRProviderBase.asr_text_priority_thread = patched_asr_text_priority_thread
 
     hello_handle.handleHelloMessage = patched_hello
     hello_msg_handler.handleHelloMessage = patched_hello
@@ -384,6 +556,7 @@ def patch_abort_and_listen_and_hello() -> None:
     asr_base.enqueue_asr_report = patched_enqueue_asr_report
     asr_base.startToChat = patched_start_to_chat
     receive_audio_handle.startToChat = patched_start_to_chat
+    listen_msg_handler.startToChat = patched_start_to_chat
     asr_base.ASRProviderBase.receive_audio = patched_receive_audio
     listen_msg_handler.ListenTextMessageHandler.handle = patched_listen_handle
 
@@ -403,6 +576,8 @@ def patch_connection_handler() -> None:
         self._passport_ready_event = None
         self._passport_asr_task = None
         self._passport_asr_gen = 0
+        self._passport_audio_epoch = 0
+        self.asr_audio_queue = _PassportEpochAudioQueue(self)
 
     async def patched_handle_connection(self, ws):
         self._passport_ready_event = asyncio.Event()
@@ -438,6 +613,7 @@ def patch_connection_handler() -> None:
         stop_ev = getattr(self, "stop_event", None)
         if stop_ev is not None:
             stop_ev.set()
+        _discard_conn_pending_audio(self)
         task = _cancel_conn_asr_task(self)
         if task is not None:
             try:
@@ -445,6 +621,7 @@ def patch_connection_handler() -> None:
             except (asyncio.CancelledError, Exception):
                 pass
         await original_close(self, ws)
+        _discard_conn_pending_audio(self)
         lingering = _cancel_conn_asr_task(self)
         if lingering is not None:
             try:
